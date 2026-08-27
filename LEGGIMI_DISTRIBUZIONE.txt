@@ -1,0 +1,6 @@
+EgoMailExtractor Community 1.39
+
+Edizione open source, licenza Apache License 2.0.
+Vedi LICENSE.txt e NOTICE.
+
+Questa edizione usa una sola email e un solo profilo di estrazione e non contiene il Wizard visuale.

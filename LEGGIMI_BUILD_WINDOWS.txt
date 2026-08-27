@@ -1,0 +1,24 @@
+EGOMAILExtractor COMMUNITY 1.39 - CREAZIONE ESEGUIBILE WINDOWS
+
+REQUISITI
+- Windows 10/11 64 bit
+- Python 3.11, 3.12 o 3.13
+
+PROCEDURA AUTOMATICA
+1. Estrai tutto il pacchetto in una cartella locale.
+2. Esegui BUILD_COMPLETO.bat.
+3. Lo script crea/riusa .venv, installa le dipendenze, esegue compileall e pytest.
+4. Se i controlli passano, PyInstaller genera la build.
+5. La cartella da distribuire viene copiata in:
+   OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community
+
+SCRIPT DISPONIBILI
+- CREA_AMBIENTE_BUILD.bat: prepara Python e lancia i test.
+- CREA_ESEGUIBILE.bat: genera l'eseguibile con PyInstaller.
+- CREA_DISTRIBUZIONE.bat: prepara la cartella finale.
+- BUILD_COMPLETO.bat: esegue tutte le fasi.
+- PULISCI_BUILD.bat: elimina build/dist temporanei.
+- AVVIA_DA_SORGENTE.bat: avvia il programma dal sorgente.
+
+LICENZA
+Apache License 2.0. Vedi LICENSE.txt e NOTICE.
