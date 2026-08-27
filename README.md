@@ -1,17 +1,29 @@
-# EgoMailExtractor Community
+# EgoMailExtractor Community 1.40.2
 
-EgoMailExtractor Community è l'edizione Open Source di EgoMailExtractor, distribuita con licenza Apache License 2.0.
+## Novità v1.40
 
-## Caratteristiche
+- I pacchetti di esportazione dei profili includono anche l'icona del profilo; l'importazione la ripristina.
+- **File → Apri → Cartella workspace** apre la cartella dati dell'applicazione.
+- Nella modifica email è visibile il selettore **Protocollo**, attualmente con la sola scelta **IMAP**.
+- La Pro aggiunge **Profilo → Tabella totali…** per configurare righe, colonne, raggruppamenti anno/mese e somme dei campi numerici nel foglio Excel `Tabella totali`.
+- Nella Community le funzioni Tabella totali e Wizard sono visibili ma rimandano alla versione Pro.
+- Splash screen e Informazioni su non mostrano il nome dell'autore.
 
-- una configurazione email;
-- un profilo di estrazione;
-- creazione e modifica manuale delle regole;
-- estrazione incrementale e storica;
-- esportazione Excel;
-- import/export dei profili di estrazione;
-- codice sorgente disponibile.
 
-Le funzioni avanzate come Wizard guidato, gestione multiprofilo e Tabella totali sono disponibili nella versione Pro.
+EgoMailExtractor Community è l'edizione open source di EgoMailExtractor, distribuita con licenza Apache License 2.0.
 
-Versione Community: 1.41.5
+## Limiti dell'edizione Community
+
+- una sola email configurata/attiva;
+- un solo profilo di estrazione;
+- nessun Wizard visuale.
+
+Non sono limitati il numero di campi, tipi mail, regole, messaggi elaborati o esportazioni. Le regole possono essere create, modificate ed eliminate dalla schermata completa.
+
+## Build Windows
+
+Eseguire `BUILD_COMPLETO.bat`. Lo script crea l'ambiente virtuale, installa le dipendenze, esegue i controlli e genera la distribuzione tramite PyInstaller.
+
+## Licenza
+
+Vedi `LICENSE.txt` (Apache License 2.0) e `NOTICE`.
