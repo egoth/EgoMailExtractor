@@ -1,6 +1,0 @@
-EgoMailExtractor Community 1.45.2
-
-- Formule riepilogative: le modifiche vengono salvate immediatamente nel profilo.
-- Valori schermata iniziale: la scelta viene salvata immediatamente nel profilo.
-- Home: campi 1 e 2 restano sotto Ultima estrazione; campi 3-6 sono mostrati in una seconda colonna a destra.
-- Le modifiche sono disponibili anche nell'edizione Community/Open Source.
