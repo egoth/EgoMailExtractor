@@ -1,0 +1,10 @@
+EgoMailExtractor Community 1.43.0
+
+- Stato operativo spostato dalla definizione del profilo alla coppia email + profilo di estrazione.
+- Prima/ultima mail, data inizio estrazione e valori Home sono indipendenti per ogni email.
+- Export profilo privo di checkpoint e valori operativi.
+- Import: in caso di nome esistente propone l'importazione con un nome differente.
+- Backup profilo completo con stato per email, abbreviazioni Regex ed Excel generali.
+- Restore con conferma esplicita prima della sovrascrittura.
+- Preferenze: aggiunta Cartella email.
+- File > Apri: Cartella degli Excel; rimosse Cartella di lavoro e Workspace.

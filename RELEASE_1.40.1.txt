@@ -1,0 +1,6 @@
+EgoMailExtractor 1.40.2
+
+Correzione:
+- aggiunto il metodo open_workspace_folder richiesto da File > Apri > Cartella workspace;
+- il workspace corrisponde alla cartella dati/configurazione dell'applicazione;
+- aggiunto test di regressione per evitare che il menu punti a un metodo inesistente.

@@ -1,4 +1,4 @@
-EgoMailExtractor Community 1.39 - Pacchetto completo sviluppatore
+EgoMailExtractor Community 1.45.2 - Pacchetto completo sviluppatore
 
 1. Leggi README.md e LEGGIMI_BUILD_WINDOWS.txt.
 2. Su Windows esegui BUILD_COMPLETO.bat.

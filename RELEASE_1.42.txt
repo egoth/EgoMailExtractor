@@ -1,0 +1,5 @@
+EgoMailExtractor Community 1.42.0
+
+- Home: data inizio, ultima estrazione e fino a due valori riepilogativi visibili.
+- Colonna informazioni allineata a destra.
+- Pulsante profilo con sfondo più chiaro.

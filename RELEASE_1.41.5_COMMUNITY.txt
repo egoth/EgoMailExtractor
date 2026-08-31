@@ -1,0 +1,7 @@
+EgoMailExtractor Community 1.41.7
+
+Edizione Open Source - Apache License 2.0.
+- Un solo account email e un solo profilo di estrazione.
+- Regole manuali complete.
+- Le funzioni Wizard e Tabella totali restano disponibili come voci informative e rimandano alla versione Pro.
+- Allineamento della numerazione di versione alla release Pro 1.41.7.

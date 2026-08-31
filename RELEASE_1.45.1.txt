@@ -1,0 +1,8 @@
+EgoMailExtractor 1.45.2
+
+- Corretto errore di Consolidamento: import globale di shutil.
+- Lettura con checkpoint progressivo su disco.
+- Il file __lettura.json viene creato appena è noto lo snapshot degli UID.
+- Ogni blocco di 50 header aggiorna processed_uids, candidate e percentuale.
+- In caso di interruzione la Lettura riprende dagli UID non ancora elaborati.
+- Al completamento le candidate vengono ordinate cronologicamente e reading_complete viene impostato a true.

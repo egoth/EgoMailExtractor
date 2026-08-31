@@ -1,0 +1,14 @@
+EgoMailExtractor Community 1.39
+
+Edizione open source basata sul core 1.39.
+
+Caratteristiche Community:
+- una sola email configurata;
+- un solo profilo di estrazione attivo;
+- creazione/modifica/eliminazione manuale di regole, campi e tipi mail;
+- estrazione incrementale e ricostruzione storica;
+- esportazione Excel;
+- log/debug e richiesta assistenza;
+- esportazione del profilo di estrazione;
+- nessun Wizard visuale;
+- licenza Apache License 2.0.

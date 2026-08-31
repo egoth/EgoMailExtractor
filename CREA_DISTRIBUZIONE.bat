@@ -12,8 +12,7 @@ xcopy /e /i /y "dist\EgoMailExtractor_Community\*" "OUTPUT_DISTRIBUZIONE\EgoMail
 copy /y "LICENSE.txt" "OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community\LICENSE.txt" >nul
 copy /y "NOTICE" "OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community\NOTICE" >nul
 copy /y "LEGGIMI_DISTRIBUZIONE.txt" "OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community\LEGGIMI.txt" >nul
-copy /y "RELEASE_1.40.txt" "OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community\RELEASE_1.40.txt" >nul
-copy /y "RELEASE_1.40.2.txt" "OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community\RELEASE_1.40.2.txt" >nul
+copy /y "RELEASE_1.45.2.txt" "OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community\RELEASE_1.45.2.txt" >nul
 echo.
 echo Cartella pronta da distribuire:
 echo %CD%\OUTPUT_DISTRIBUZIONE\EgoMailExtractor_Community

@@ -1,0 +1,8 @@
+EgoMailExtractor 1.40.2
+
+- L'estrazione incrementale è ora registrata come una sola sessione nel log.
+- INIZIO sessione scritto una sola volta.
+- Dopo ogni mail: salvataggio Excel generale e checkpoint.
+- Dettaglio di ogni mail mantenuto nel log senza aprire/chiudere una nuova sessione.
+- Riepilogo FINE scritto una sola volta a completamento o interruzione.
+- Il riepilogo indica lo stato della sessione, mail esaminate, match, aggiornamenti, righe finali e checkpoint.

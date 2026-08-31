@@ -1,0 +1,7 @@
+EgoMailExtractor Community 1.44
+
+- Backup multi-profilo con selezione dei profili.
+- Restore selettivo: dopo la scelta del file ZIP vengono elencati i profili contenuti.
+- Stato estrazione in home con profilo corrente e due fasi: Lettura ed Estrazione, entrambe con percentuale.
+- La fase Lettura individua le email candidate e legge le intestazioni/date necessarie all'ordinamento e ai filtri.
+- LEGGIMI di distribuzione aggiornato alla versione 1.44.

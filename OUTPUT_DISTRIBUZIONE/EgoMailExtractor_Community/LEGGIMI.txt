@@ -1,6 +1,6 @@
 EgoMailExtractor Community 1.45.2
 
-Questa cartella contiene la distribuzione di EgoMailExtractor Community versione 1.45.
+Questa cartella contiene la distribuzione di EgoMailExtractor Community versione 1.45.2.
 
 AVVIO
 - Avvia EgoMailExtractor dall'eseguibile presente in questa cartella.

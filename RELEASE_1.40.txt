@@ -1,0 +1,8 @@
+EgoMailExtractor 1.40
+
+- Export profilo include l'icona e l'import la ripristina.
+- File > Apri > Cartella workspace.
+- Schermata Email: selettore Protocollo (IMAP).
+- Pro: Profilo > Tabella totali con righe, colonne, raggruppamento anno/mese e somme numeriche.
+- Community: Tabella totali e menu Wizard visibili come funzioni Pro con collegamento informativo.
+- Splash e Informazioni su: rimosso il nome dell'autore.

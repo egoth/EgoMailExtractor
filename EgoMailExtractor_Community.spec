@@ -16,7 +16,7 @@ a = Analysis(
         (str(root / "RELEASE_1.39_COMMUNITY.txt"), "."),
         (str(root / "EDITION.txt"), "."),
     ],
-    hiddenimports=[],
+    hiddenimports=['pythoncom','pywintypes','win32com','win32com.client','win32timezone'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EgoMailExtractor - Help regole di estrazione</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;line-height:1.5;color:#222;max-width:1050px;margin:0 auto;padding:28px;background:#fafafa}
+h1,h2,h3{color:#18324a} h1{border-bottom:3px solid #365f7d;padding-bottom:10px}
+nav,.box{background:#fff;border:1px solid #ddd;border-radius:8px;padding:16px 20px;margin:18px 0}
+nav a{display:inline-block;margin:3px 14px 3px 0;color:#175a91;text-decoration:none}
+code{background:#f0f2f4;padding:2px 5px;border-radius:4px} pre{background:#f0f2f4;padding:14px;overflow:auto;border-radius:6px}
+table{border-collapse:collapse;width:100%;background:#fff;margin:12px 0 24px} th,td{border:1px solid #d5d5d5;padding:8px 10px;text-align:left;vertical-align:top} th{background:#edf3f7}
+.good{border-left:5px solid #3b8b4b}.warn{border-left:5px solid #d69b23}.note{border-left:5px solid #4b78a8}
+.small{color:#555;font-size:.94em}
+</style>
+</head>
+<body>
+<h1>Regole di estrazione di EgoMailExtractor</h1>
+<p>Questo documento descrive i parametri disponibili nell'editor di una regola di estrazione. Una regola di estrazione viene applicata <strong>solo dopo</strong> che la mail ha soddisfatto tutte le regole di selezione del relativo <em>Tipo mail</em>.</p>
+
+<nav>
+<a href="#schema">Schema generale</a><a href="#origine">Origine</a><a href="#strategie">Strategie</a><a href="#abbreviazioni">Abbreviazioni Regex</a><a href="#parametri">Parametri</a><a href="#sovrascrittura">Valore già presente</a><a href="#conversioni">Conversioni</a><a href="#tipi">Tipi Excel</a><a href="#riconciliazione">Riconciliazione</a><a href="#anteprima">Anteprima</a><a href="#esempi">Esempi</a><a href="#riepiloghi">Riepiloghi Excel</a><a href="#problemi">Problemi comuni</a>
+</nav>
+
+<h2 id="schema">1. Schema generale</h2>
+<div class="box note"><strong>Profilo di estrazione → Tipi mail → Regole di selezione → Regole di estrazione.</strong><br>Le regole di selezione decidono se una mail appartiene a un tipo. Le regole di estrazione leggono i valori da quella mail e li salvano nei campi del profilo.</div>
+<p>Ogni regola di estrazione specifica: un nome, un campo di destinazione, la sorgente da leggere, una strategia di ricerca, un'eventuale conversione e il tipo con cui il dato sarà scritto in Excel.</p>
+
+<h2 id="origine">2. Origine</h2>
+<table><tr><th>Valore</th><th>Significato</th><th>Esempio</th></tr>
+<tr><td><code>body</code></td><td>Cerca nel corpo testuale della mail.</td><td>Codice di conferma, check-in, importi.</td></tr>
+<tr><td><code>subject</code></td><td>Cerca nell'oggetto della mail.</td><td>Importo presente nell'oggetto del pagamento.</td></tr>
+<tr><td><code>sender</code></td><td>Cerca nel mittente.</td><td>Informazioni codificate nell'indirizzo o nome mittente.</td></tr>
+<tr><td><code>date</code></td><td>Cerca nella Data mail dell'header.</td><td>Per salvare o riconoscere data e ora con cui la mail è stata inviata.</td></tr>
+<tr><td><code>message_id</code></td><td>Cerca nell'ID mail / Message-ID.</td><td>Per estrarre o memorizzare l'identificativo univoco dichiarato nell'header della mail.</td></tr></table>
+
+<h2 id="strategie">3. Strategie</h2>
+<h3>3.1 Regex</h3>
+<p>Usa un'espressione regolare per individuare il testo. Il programma prende la corrispondenza indicata da <strong>Occorrenza</strong> e, al suo interno, il <strong>Gruppo regex</strong>.</p>
+<pre>Codice di conferma\s+([A-Z0-9]+)</pre>
+<p>Con <code>Gruppo regex = 1</code> viene preso il codice tra parentesi.</p>
+<div class="box good">La regex è utile quando il dato ha una forma riconoscibile ma non è sempre sulla stessa riga o nella stessa posizione.</div>
+
+<h2 id="abbreviazioni">3A. Abbreviazioni Regex</h2>
+<p>Da <strong>File → Preferenze → Abbreviazioni Regex</strong> puoi definire una tabella globale di sostituzioni per rendere le espressioni regolari più leggibili.</p>
+<table><tr><th>Abbreviazione</th><th>Sostituzione Regex</th></tr>
+<tr><td><code>--ALFANUMERICO--</code></td><td><code>[A-Za-z0-9]+</code></td></tr>
+<tr><td><code>--IMPORTO--</code></td><td><code>[0-9.]+,[0-9]{2}</code></td></tr></table>
+<p>Una regola scritta come:</p>
+<pre>Codice di conferma\s+(--ALFANUMERICO--)</pre>
+<p>prima dell'esecuzione viene preprocessata e diventa:</p>
+<pre>Codice di conferma\s+([A-Za-z0-9]+)</pre>
+<div class="box note">La ricerca dell'abbreviazione è <strong>letterale</strong>: il testo nella colonna Abbreviazione non è interpretato come regex. La sostituzione, invece, viene inserita così com'è nella regex finale.</div>
+<p>Il preprocessore viene applicato a:</p>
+<ul><li>regole di selezione mail in modalità <code>regex</code>;</li><li>campo <strong>Regex</strong> delle regole di estrazione;</li><li>campo <strong>Regex sul valore</strong> della strategia <code>after_trigger</code>.</li></ul>
+<p>Non viene applicato ai match <code>Contiene</code> né al testo del Trigger di <code>after_trigger</code>, perché questi non sono espressioni regolari.</p>
+<p>Le abbreviazioni possono essere composte: una sostituzione può contenere un'altra abbreviazione. Il programma esegue l'espansione in più passaggi con un limite di sicurezza per evitare cicli infiniti.</p>
+
+<h3>3.2 after_trigger</h3>
+<p>Cerca una parola o frase esatta, chiamata <strong>Trigger</strong>, poi prende la N-esima riga non vuota successiva.</p>
+<pre>Check-in
+
+dom 16 ago
+15:00</pre>
+<p>Con Trigger <code>Check-in</code> e Offset righe non vuote <code>1</code> viene preso <code>dom 16 ago</code>. Con offset <code>2</code> verrebbe preso <code>15:00</code>.</p>
+<p>È possibile applicare una <strong>Regex sul valore</strong> per ritagliare ulteriormente la riga recuperata.</p>
+
+<h3>3.3 constant</h3>
+<p>Non legge alcun testo dalla mail. Memorizza sempre il valore indicato in <strong>Valore costante</strong>. È utile, ad esempio, per valorizzare <code>piattaforma = Airbnb</code> per tutte le mail di un determinato tipo.</p>
+
+<h2 id="parametri">4. Parametri dell'editor</h2>
+<table><tr><th>Parametro</th><th>Uso</th></tr>
+<tr><td>Nome regola</td><td>Nome descrittivo della regola. Serve per riconoscerla nell'elenco; non è il nome della colonna Excel.</td></tr>
+<tr><td>Campo da popolare</td><td>Campo del profilo nel quale viene memorizzato il risultato.</td></tr>
+<tr><td>Regex</td><td>Usata solo dalla strategia <code>regex</code>.</td></tr>
+<tr><td>Trigger</td><td>Usato solo dalla strategia <code>after_trigger</code>.</td></tr>
+<tr><td>Occorrenza</td><td>Se il match appare più volte, indica quale usare: 1 = prima, 2 = seconda, ecc.</td></tr>
+<tr><td>Gruppo regex</td><td>Quale gruppo catturato dalla regex memorizzare. Il gruppo 0 indica l'intero match; normalmente si usa 1 o superiore.</td></tr>
+<tr><td>Offset righe non vuote</td><td>Per <code>after_trigger</code>: quante righe non vuote saltare dopo il trigger prima di prendere il valore.</td></tr>
+<tr><td>Regex sul valore</td><td>Filtro aggiuntivo applicato al valore trovato da <code>after_trigger</code>.</td></tr>
+<tr><td>Valore costante</td><td>Usato solo dalla strategia <code>constant</code>.</td></tr>
+<tr><td>Se la cella Excel ha già un valore</td><td>Stabilisce cosa fare quando una regola sta per scrivere in una cella già valorizzata: Sostituisci, Non sostituire oppure Somma (solo per campi NUMERO).</td></tr></table>
+
+<h2 id="sovrascrittura">5. Se la cella Excel contiene già un valore</h2>
+<p>La scelta appartiene alla <strong>singola regola di estrazione</strong>. Questo permette, ad esempio, a una regola di aggiornare sempre un importo e a un'altra di mantenere il primo valore trovato.</p>
+<table><tr><th>Scelta</th><th>Comportamento</th></tr>
+<tr><td><strong>Sostituisci</strong></td><td>Il nuovo valore estratto prende il posto di quello già presente. È il comportamento predefinito e mantiene la compatibilità con i profili precedenti.</td></tr>
+<tr><td><strong>Non sostituire</strong></td><td>Se la cella è già valorizzata, conserva il valore esistente. Se la cella è vuota, scrive normalmente il nuovo valore.</td></tr>
+<tr><td><strong>Somma</strong></td><td>Disponibile solo per un campo di tipo <strong>NUMERO</strong>. Se esiste già un numero, aggiunge il nuovo valore al precedente. Se la cella è vuota, scrive il primo valore.</td></tr></table>
+<div class="box note">Durante l'estrazione le mail sono applicate dalla <strong>più vecchia alla più recente</strong>. Perciò Sostituisci, Non sostituire e Somma hanno un risultato deterministico anche quando più mail aggiornano la stessa riga.</div>
+
+<h2 id="conversioni">6. Conversione valore</h2>
+<table><tr><th>Conversione</th><th>Risultato</th></tr>
+<tr><td><code>text</code></td><td>Mantiene il valore come testo.</td></tr>
+<tr><td><code>upper</code></td><td>Testo convertito in maiuscolo.</td></tr>
+<tr><td><code>int</code></td><td>Prende il primo numero intero contenuto nel testo.</td></tr>
+<tr><td><code>money</code></td><td>Converte importi italiani/europei, ad esempio <code>1.234,56 €</code>, nel numero 1234,56.</td></tr>
+<tr><td><code>guest_count</code></td><td>Somma i numeri presenti. Esempio: <code>2 adulti, 3 bambini</code> → 5.</td></tr>
+<tr><td><code>date_it_email_year</code></td><td>Interpreta una data italiana, ad esempio <code>dom 16 ago</code>. Se l'anno non è presente usa l'anno della mail.</td></tr></table>
+<div class="box warn"><strong>Conversione</strong> e <strong>Tipo cella Excel</strong> sono concetti diversi. La conversione decide come interpretare il testo trovato; il tipo Excel decide come scrivere il risultato nel foglio.</div>
+
+<h2 id="tipi">7. Tipo cella Excel</h2>
+<table><tr><th>Tipo</th><th>Uso</th></tr>
+<tr><td>TESTO</td><td>Codici, nomi, descrizioni, ID prenotazione.</td></tr>
+<tr><td>DATA</td><td>Check-in, check-out e altre date. Viene scritta come vera data Excel.</td></tr>
+<tr><td>NUMERO</td><td>Quantità, giorni, ospiti e importi. Può essere formattato come valuta €.</td></tr></table>
+
+<h2 id="riconciliazione">8. Chiave di riconciliazione</h2>
+<p>Se un campo è marcato come <strong>Chiave di riconciliazione</strong>, EgoMailExtractor lo usa per capire che informazioni provenienti da mail diverse riguardano lo stesso oggetto.</p>
+<p>Esempio: una mail Airbnb di prenotazione e una successiva mail di pagamento contengono entrambe <code>HMWPYHB3RP</code>. Se <code>id_soggiorno</code> è una chiave, i dati vengono uniti nello stesso record invece di creare due righe separate.</p>
+
+<h2 id="anteprima">9. Anteprima e colori</h2>
+<p>Nella finestra principale, selezionando un tipo mail che fa match, ogni regola di estrazione riceve un colore. Il <strong>trigger o match</strong> viene evidenziato con quel colore; il <strong>testo realmente prelevato</strong> viene sottolineato. Passando il mouse sulla zona evidenziata compare un tooltip con il campo di destinazione e il valore memorizzato.</p>
+<p>Nell'editor della regola, in basso sono presenti due riquadri:</p>
+<ul><li><strong>Traduzione della regola in forma umana</strong>: descrive in italiano ciò che la regola farà.</li><li><strong>Applicazione sulla mail corrente</strong>: prova immediatamente i parametri non ancora salvati sulla mail aperta.</li></ul>
+
+<h2 id="esempi">10. Esempi</h2>
+<h3>Airbnb - Codice di conferma</h3>
+<pre>Origine: body
+Strategia: after_trigger
+Trigger: Codice di conferma
+Offset righe non vuote: 1
+Conversione: text
+Campo: id_soggiorno
+Tipo Excel: TESTO
+Chiave di riconciliazione: sì</pre>
+
+<h3>Airbnb - Totale pagato dall'ospite</h3>
+<pre>Origine: body
+Strategia: after_trigger
+Trigger: Totale (EUR)
+Offset righe non vuote: 1
+Conversione: money
+Campo: importo_pagato_ospite
+Tipo Excel: NUMERO
+Formato valuta €: sì</pre>
+
+<h3>Airbnb - Numero ospiti</h3>
+<pre>Origine: body
+Strategia: after_trigger
+Trigger: Ospiti
+Offset righe non vuote: 1
+Conversione: guest_count
+Campo: numero_ospiti
+Tipo Excel: NUMERO</pre>
+
+<h3>Vrbo - Numero prenotazione</h3>
+<pre>Origine: body
+Strategia: after_trigger
+Trigger: Numero Prenotazione
+Offset righe non vuote: 1
+Conversione: text
+Campo: id_soggiorno
+Tipo Excel: TESTO</pre>
+
+
+<h2 id="riepiloghi">Campi contatore e formule riepilogative</h2>
+<h3>Contatore Tipo mail</h3>
+<p>In <strong>Campi…</strong> un campo di tipo Numero può essere associato a un <strong>Tipo mail</strong>. Ogni volta che una mail di quel tipo viene riconciliata sulla stessa riga, il campo viene incrementato: 1 al primo riscontro, poi 2, 3 e così via. Il conteggio avviene una sola volta per mail e per Tipo mail.</p>
+<h3>Formule riepilogative nominate</h3>
+<p>I campi con Formula finale generano alias utilizzabili nelle formule aggiuntive:</p>
+<ul><li><code>somma_importo</code> per un campo <code>importo</code> con Formula finale Somma;</li><li><code>conta_nome_ospite</code> per un campo <code>nome_ospite</code> con Formula finale Conta.</li></ul>
+<pre>=somma_importo/somma_durata_giorni</pre>
+<p>La formula viene scritta sotto i dati e gli alias vengono sostituiti automaticamente con le celle reali della riga riepilogativa.</p>
+
+<h2 id="campi-calcolati">Campi calcolati del profilo</h2>
+<p>Da <strong>Profilo → Gestisci campi e tipi Excel → Campi calcolati…</strong> è possibile gestire i calcoli globali che vengono eseguiti dopo le regole di estrazione.</p>
+<p>Per <strong>Differenza giorni tra due date</strong> si scelgono il campo numerico di destinazione, il campo Data iniziale e il campo Data finale.</p>
+<p>La priorità <strong>Non sovrascrivere valori impostati da una regola</strong> lascia prevalere una regola esplicita della mail corrente. Ad esempio una cancellazione può impostare <code>durata_giorni = 0</code> senza che il calcolo automatico tra check-in e check-out lo riporti al numero originario. Con <strong>Ricalcola sempre</strong>, invece, il calcolo automatico ha l'ultima parola.</p>
+
+<h2 id="problemi">11. Problemi comuni</h2>
+<table><tr><th>Problema</th><th>Controlli</th></tr>
+<tr><td>La regola non trova nulla</td><td>Verifica Origine, strategia, maiuscole/minuscole del trigger, Occorrenza e Offset. Per una regex controlla che il gruppo richiesto esista.</td></tr>
+<tr><td>Viene preso il valore sbagliato</td><td>Rendi il trigger più specifico, cambia Occorrenza oppure usa una Regex sul valore.</td></tr>
+<tr><td>Un importo finisce come testo</td><td>Usa conversione <code>money</code> e Tipo Excel <code>NUMERO</code>.</td></tr>
+<tr><td>Un codice alfanumerico viene alterato</td><td>I codici come <code>HMWPYHB3RP</code> devono essere di tipo Excel <strong>TESTO</strong>, non NUMERO. Dalla v1.11, se un campo NUMERO riceve un valore chiaramente alfanumerico, il programma lo conserva come testo anziché estrarne solo le cifre.</td></tr>
+<tr><td>Una data non viene riconosciuta</td><td>Usa <code>date_it_email_year</code> per date italiane e Tipo Excel <code>DATA</code>.</td></tr>
+<tr><td>Due mail producono due righe invece di una</td><td>Verifica che entrambe estraggano lo stesso campo chiave e che quel campo sia marcato come Chiave di riconciliazione.</td></tr></table>
+
+<p class="small">EgoMailExtractor - Help locale. Il file viene aperto dal pulsante <strong>Help regole…</strong> presente nell'editor delle regole di estrazione.</p>
+</body></html>
