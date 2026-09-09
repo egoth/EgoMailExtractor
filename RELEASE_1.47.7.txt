@@ -1,0 +1,5 @@
+EgoMailExtractor Community 1.47.7 - 09/09/2026
+
+- La finestra "Regole di estrazione" viene centrata rispetto alla finestra principale.
+- La finestra "Nuova/Modifica regola" viene centrata rispetto alla finestra "Regole di estrazione".
+- Allineamento di versione con la release Pro 1.47.7.

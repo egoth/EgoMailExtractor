@@ -91,10 +91,36 @@ def excel_value(value: Any, field: dict[str, Any]) -> Any:
             return value.date()
         if isinstance(value, date):
             return value
+        text = str(value).strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y"):
+            try:
+                return datetime.strptime(text[:10], fmt).date()
+            except Exception:
+                pass
         try:
-            return date.fromisoformat(str(value)[:10])
+            return date.fromisoformat(text[:10])
         except Exception:
             return value
+    if kind == "datetime":
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        text = str(value).strip().replace(",", " ")
+        text = re.sub(r"\s+", " ", text)
+        try:
+            return datetime.fromisoformat(text)
+        except Exception:
+            pass
+        for fmt in (
+            "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S.%f",
+            "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S.%f",
+        ):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                pass
+        return value
     return value
 
 
@@ -118,31 +144,66 @@ def final_formula_aliases(profile: dict[str, Any]) -> dict[str, str]:
     return aliases
 
 
+
+def summary_formula_aliases(profile: dict[str, Any]) -> dict[str, str]:
+    """Alias utilizzabili per riferire altre formule riepilogative.
+
+    Il nome visuale viene trasformato in un identificatore stabile, ad esempio
+    ``pagato mese corrente`` -> ``pagato_mese_corrente``. Gli alias duplicati
+    vengono ignorati per evitare riferimenti ambigui.
+    """
+    candidates: list[tuple[str, str]] = []
+    for item in profile.get("summary_formulas", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        alias = re.sub(r"[^\w]+", "_", name, flags=re.UNICODE).strip("_")
+        if not alias:
+            continue
+        if alias[0].isdigit():
+            alias = "formula_" + alias
+        candidates.append((alias, name))
+    counts: dict[str, int] = {}
+    for alias, _name in candidates:
+        counts[alias.casefold()] = counts.get(alias.casefold(), 0) + 1
+    return {
+        alias: name for alias, name in candidates
+        if counts.get(alias.casefold(), 0) == 1
+    }
+
+
 def expand_summary_formula(
     formula: str,
     profile: dict[str, Any],
     alias_cells: dict[str, str],
 ) -> str:
-    """Converte gli alias ``somma_*``/``conta_*`` in riferimenti Excel."""
+    """Converte alias di campi finali e formule riepilogative in riferimenti Excel."""
     text = str(formula or "").strip()
     if not text:
         raise ValueError("Formula riepilogativa vuota")
     if not text.startswith("="):
         text = "=" + text
 
-    available = {k.casefold(): v for k, v in alias_cells.items()}
-    token_re = re.compile(r"\b(?:somma|conta)_[A-Za-z0-9_À-ÖØ-öø-ÿ]+\b", re.I)
-    unknown: set[str] = set()
+    expanded = text
+    # Sostituzione per alias completi, dal più lungo al più corto.
+    for alias, cell in sorted(alias_cells.items(), key=lambda kv: -len(kv[0])):
+        expanded = re.sub(
+            rf"(?<!\w){re.escape(alias)}(?!\w)",
+            str(cell),
+            expanded,
+            flags=re.I,
+        )
 
-    def repl(match: re.Match[str]) -> str:
-        token = match.group(0)
-        cell = available.get(token.casefold())
-        if cell is None:
-            unknown.add(token)
-            return token
-        return cell
-
-    expanded = token_re.sub(repl, text)
+    # Manteniamo il controllo esplicito sugli alias somma_/conta_ inesistenti.
+    known = {k.casefold() for k in alias_cells}
+    unknown = {
+        m.group(0) for m in re.finditer(
+            r"\b(?:somma|conta)_[A-Za-z0-9_À-ÖØ-öø-ÿ]+\b", text, flags=re.I
+        )
+        if m.group(0).casefold() not in known
+    }
     if unknown:
         valid = ", ".join(sorted(alias_cells)) or "<nessun alias disponibile>"
         raise ValueError(
@@ -340,6 +401,21 @@ def summary_formula_display(item: dict[str, Any]) -> str:
     mode = "finestra mobile" if str(item.get("period_mode", "rolling") or "rolling") == "rolling" else "periodo di calendario"
     return f"{op} {item.get('field','')} se {item.get('date_field','')} è nell'ultimo {period} ({mode})"
 
+def field_decimals(spec: dict[str, Any]) -> int:
+    try:
+        return max(0, min(10, int(spec.get("decimals", 2))))
+    except (TypeError, ValueError):
+        return 2
+
+
+def excel_number_format(spec: dict[str, Any]) -> str:
+    decimals = field_decimals(spec)
+    decimal_part = "" if decimals == 0 else "." + ("0" * decimals)
+    if str(spec.get("format", "") or "") == "currency_eur":
+        return "#,##0" + decimal_part + " [$€-it-IT]"
+    return "#,##0" + decimal_part
+
+
 def write_excel(path: str | Path, records: list[dict[str, Any]], profile: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -362,12 +438,12 @@ def write_excel(path: str | Path, records: list[dict[str, Any]], profile: dict[s
             field = fields[idx]
             spec = definitions.get(field, {"type": "text"})
             kind = normalize_field_type(spec.get("type"))
-            if spec.get("format") == "currency_eur" and isinstance(cell.value, (int, float)):
-                cell.number_format = '#,##0.00 [$€-it-IT]'
+            if kind == "number" and isinstance(cell.value, (int, float)):
+                cell.number_format = excel_number_format(spec)
             elif kind == "date" and isinstance(cell.value, (date, datetime)):
                 cell.number_format = "dd/mm/yyyy"
-            elif kind == "number" and isinstance(cell.value, (int, float)):
-                cell.number_format = "0.00" if isinstance(cell.value, float) and not float(cell.value).is_integer() else "0"
+            elif kind == "datetime" and isinstance(cell.value, datetime):
+                cell.number_format = "dd/mm/yyyy hh:mm:ss"
 
     # Una sola riga riepilogativa, immediatamente dopo l'ultimo record. Ogni
     # campo può decidere indipendentemente se scrivere SOMMA o CONTA.
@@ -402,10 +478,8 @@ def write_excel(path: str | Path, records: list[dict[str, Any]], profile: dict[s
             cell = ws.cell(summary_row, col_idx, formula)
             cell.font = Font(bold=True)
             spec = definitions.get(field_name, {"type": "text"})
-            if formula_kind == "sum" and spec.get("format") == "currency_eur":
-                cell.number_format = '#,##0.00 [$€-it-IT]'
-            elif formula_kind == "sum":
-                cell.number_format = "0.00" if normalize_field_type(spec.get("type")) == "number" else "0"
+            if formula_kind == "sum" and normalize_field_type(spec.get("type")) == "number":
+                cell.number_format = excel_number_format(spec)
             else:
                 cell.number_format = "0"
             alias_name = ("somma_" if formula_kind == "sum" else "conta_") + field_name
@@ -425,6 +499,15 @@ def write_excel(path: str | Path, records: list[dict[str, Any]], profile: dict[s
     ]
     if custom_formulas:
         first_custom_row = (summary_row + 1) if summary_row is not None else (data_last_row + 1)
+        summary_alias_names = summary_formula_aliases(profile)
+        summary_rows = {
+            str(item.get("name", "") or "").strip(): first_custom_row + offset
+            for offset, item in enumerate(custom_formulas)
+        }
+        for alias, formula_name in summary_alias_names.items():
+            if formula_name in summary_rows:
+                alias_cells[alias] = f"B{summary_rows[formula_name]}"
+
         for offset, item in enumerate(custom_formulas):
             row_idx = first_custom_row + offset
             name = str(item.get("name", "") or "").strip()
@@ -436,6 +519,10 @@ def write_excel(path: str | Path, records: list[dict[str, Any]], profile: dict[s
             value_cell = ws.cell(row_idx, 2, expanded)
             name_cell.font = Font(bold=True)
             value_cell.font = Font(bold=True)
+            if str(item.get("kind", "") or "") == "period_aggregate":
+                source_spec = definitions.get(str(item.get("field", "") or ""), {})
+                if normalize_field_type(source_spec.get("type")) == "number":
+                    value_cell.number_format = excel_number_format(source_spec)
 
     ws.freeze_panes = "A2"
     # Il filtro comprende solo intestazione + dati, non la riga di formule.
@@ -464,14 +551,18 @@ def read_excel_home_summary_values(
     profile: dict[str, Any],
     selected_fields: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Legge dall'Excel i valori delle formule finali scelti per la home.
+    """Legge i valori riepilogativi della home senza avviare Microsoft Excel.
 
-    I valori vengono letti con ``data_only=True`` dalla riga riepilogativa.
-    Se Excel non ha ancora valorizzato la cache delle formule, su Windows viene
-    chiesto a Microsoft Excel di ricalcolare e salvare il file, quindi la
-    lettura viene ripetuta. In questo modo la home mostra il valore effettivo
-    prodotto da Excel, non un calcolo parallelo dell'applicazione.
+    openpyxl legge prima gli eventuali valori già memorizzati nel file. Se la
+    cache delle formule non è disponibile (caso normale subito dopo un
+    salvataggio openpyxl), SOMMA/CONTA e le formule riepilogative vengono
+    valutate direttamente sui dati del foglio. Questo evita di creare una
+    seconda istanza COM di Excel solo per aggiornare la home, eliminando le
+    eccezioni RPC 0x80010108/0x800706be osservate durante test e build.
     """
+    import ast
+    from datetime import date as _date, datetime as _datetime, timedelta as _timedelta
+
     p = Path(path)
     if not p.exists():
         return []
@@ -479,121 +570,142 @@ def read_excel_home_summary_values(
     if not selected:
         return []
     definitions = field_map(profile)
+    computed_names = {str(x.get("field", "") or "") for x in profile.get("computed_fields", []) or [] if isinstance(x, dict)}
+    summary_defs = {str(x.get("name", "") or ""): x for x in profile.get("summary_formulas", []) or [] if isinstance(x, dict) and x.get("name")}
 
-    def _read() -> list[dict[str, Any]]:
-        wb = load_workbook(p, data_only=True, read_only=False)
-        try:
-            ws = wb["Dati"] if "Dati" in wb.sheetnames else wb.active
-            headers = [str(c.value or "") for c in ws[1]]
-            if "_EgoMeta" in wb.sheetnames:
-                try:
-                    data_last_row = int(wb["_EgoMeta"]["A1"].value or 1)
-                except Exception:
-                    data_last_row = max(1, ws.max_row - 1)
+    # Due aperture openpyxl: una per i valori cached, una per formule/dati.
+    wb_values = load_workbook(p, data_only=True, read_only=False)
+    wb_formulas = load_workbook(p, data_only=False, read_only=False)
+    try:
+        ws = wb_values["Dati"] if "Dati" in wb_values.sheetnames else wb_values.active
+        wsf = wb_formulas["Dati"] if "Dati" in wb_formulas.sheetnames else wb_formulas.active
+        headers = [str(c.value or "") for c in ws[1]]
+        if "_EgoMeta" in wb_values.sheetnames:
+            try: data_last_row = int(wb_values["_EgoMeta"]["A1"].value or 1)
+            except Exception: data_last_row = max(1, ws.max_row - 1)
+        else:
+            data_last_row = max(1, ws.max_row - 1)
+        summary_row = data_last_row + 1
+
+        def _column_values(name):
+            if name not in headers: return []
+            ci=headers.index(name)+1
+            return [ws.cell(r,ci).value for r in range(2,data_last_row+1)]
+
+        def _number(v):
+            if isinstance(v,bool): return float(int(v))
+            if isinstance(v,(int,float)): return float(v)
+            if isinstance(v,str):
+                s=v.strip().replace('€','').replace(' ','')
+                if not s: return None
+                if ',' in s: s=s.replace('.','').replace(',','.')
+                try:return float(s)
+                except Exception:return None
+            return None
+
+        aliases={}
+        for name,spec in definitions.items():
+            kind=str(spec.get('final_formula','') or '').lower()
+            vals=_column_values(name)
+            if kind=='sum': aliases['somma_'+name]=sum(x for x in (_number(v) for v in vals) if x is not None)
+            elif kind=='count': aliases['conta_'+name]=sum(1 for v in vals if v not in (None,''))
+        summary_alias_names = summary_formula_aliases(profile)
+
+        def _safe_arithmetic(expr, extra_aliases=None):
+            text=str(expr or '').strip()
+            if text.startswith('='): text=text[1:]
+            merged_aliases = dict(aliases)
+            merged_aliases.update(extra_aliases or {})
+            for alias,value in sorted(merged_aliases.items(),key=lambda x:-len(x[0])):
+                text=re.sub(r'\b'+re.escape(alias)+r'\b',str(value),text,flags=re.I)
+            node=ast.parse(text,mode='eval')
+            allowed=(ast.Expression,ast.BinOp,ast.UnaryOp,ast.Constant,ast.Add,ast.Sub,ast.Mult,ast.Div,ast.Pow,ast.Mod,ast.USub,ast.UAdd)
+            if any(not isinstance(n,allowed) for n in ast.walk(node)): raise ValueError('Formula non aritmetica')
+            return eval(compile(node,'<summary>','eval'),{'__builtins__':{}},{})
+
+        def _as_date(v):
+            if isinstance(v,_datetime): return v.date()
+            if isinstance(v,_date): return v
+            if isinstance(v,str):
+                for fmt in ('%Y-%m-%d','%d/%m/%Y','%d-%m-%Y'):
+                    try:return _datetime.strptime(v.strip()[:10],fmt).date()
+                    except Exception: pass
+            return None
+
+        def _period_value(item):
+            vals=_column_values(str(item.get('field','') or ''))
+            dates=_column_values(str(item.get('date_field','') or ''))
+            today=_date.today(); period=str(item.get('period','month') or 'month').lower(); mode=str(item.get('period_mode','rolling') or 'rolling').lower()
+            if mode=='calendar':
+                if period=='year': start=_date(today.year,1,1); end=_date(today.year,12,31)
+                else:
+                    start=_date(today.year,today.month,1)
+                    end=(_date(today.year+1,1,1) if today.month==12 else _date(today.year,today.month+1,1))-_timedelta(days=1)
             else:
-                data_last_row = max(1, ws.max_row - 1)
-            summary_row = data_last_row + 1
-            result: list[dict[str, Any]] = []
-            summary_defs = {
-                str(item.get("name", "") or ""): item
-                for item in profile.get("summary_formulas", []) or []
-                if isinstance(item, dict) and item.get("name")
-            }
-            computed_names = {
-                str(item.get("field", "") or "")
-                for item in profile.get("computed_fields", []) or []
-                if isinstance(item, dict) and item.get("field")
-            }
-            for ref in selected:
-                ref = str(ref)
-                source_kind, _, raw_name = ref.partition(":")
-                if not raw_name:
-                    source_kind, raw_name = "field", ref
+                start=today-_timedelta(days=365 if period=='year' else 30); end=today
+            picked=[v for v,d in zip(vals,dates) if (lambda dd: dd is not None and start<=dd<=end)(_as_date(d))]
+            if str(item.get('operation','sum') or 'sum').lower()=='count': return sum(1 for v in picked if v not in (None,''))
+            return sum(x for x in (_number(v) for v in picked) if x is not None)
 
-                if source_kind == "summary":
-                    # Le formule riepilogative nominate sono scritte in colonna A/B
-                    # dopo la riga delle formule finali.
-                    value = None
-                    for row_idx in range(summary_row, ws.max_row + 1):
-                        if str(ws.cell(row_idx, 1).value or "") == raw_name:
-                            value = ws.cell(row_idx, 2).value
-                            break
-                    result.append({
-                        "field": ref, "label": raw_name, "kind": "summary",
-                        "value": value, "format": "",
-                    })
-                    continue
+        _summary_cache = {}
+        _summary_stack = set()
 
-                if raw_name not in headers:
-                    continue
-                spec = definitions.get(raw_name, {})
-                col_idx = headers.index(raw_name) + 1
-                final_kind = str(spec.get("final_formula", "") or "").lower()
-                if final_kind in {"sum", "count"}:
-                    value = ws.cell(summary_row, col_idx).value
-                    result.append({
-                        "field": ref, "label": raw_name, "kind": final_kind,
-                        "value": value, "format": str(spec.get("format", "") or ""),
-                    })
-                    continue
-
-                # Un campo calcolato privo di Formula finale mostra l'ultimo
-                # valore non vuoto prodotto nelle righe dati.
-                if source_kind == "computed" or raw_name in computed_names:
-                    value = None
-                    for row_idx in range(data_last_row, 1, -1):
-                        candidate = ws.cell(row_idx, col_idx).value
-                        if candidate not in (None, ""):
-                            value = candidate
-                            break
-                    result.append({
-                        "field": ref, "label": raw_name, "kind": "computed",
-                        "value": value, "format": str(spec.get("format", "") or ""),
-                    })
-            return result
-        finally:
-            wb.close()
-
-    result = _read()
-    if result and all(item.get("value") is not None for item in result):
-        return result
-
-    # La cache formula può essere vuota subito dopo un salvataggio openpyxl.
-    # Se possibile, facciamo ricalcolare il file a Microsoft Excel.
-    import sys
-    if sys.platform == "win32":
-        try:
-            import pythoncom
-            import win32com.client
-            pythoncom.CoInitialize()
-            excel = None
-            wb_com = None
+        def _summary_value_by_name(name):
+            if name in _summary_cache:
+                return _summary_cache[name]
+            if name in _summary_stack:
+                raise ValueError(f"Riferimento circolare tra formule riepilogative: {name}")
+            item = summary_defs.get(name)
+            if not item:
+                raise ValueError(f"Formula riepilogativa non definita: {name}")
+            _summary_stack.add(name)
             try:
-                excel = win32com.client.DispatchEx("Excel.Application")
-                excel.Visible = False
-                excel.DisplayAlerts = False
-                wb_com = excel.Workbooks.Open(str(p.resolve()))
-                try:
-                    excel.CalculateFullRebuild()
-                except Exception:
-                    excel.Calculate()
-                wb_com.Save()
+                if str(item.get('kind','') or '') == 'period_aggregate':
+                    value = _period_value(item)
+                else:
+                    dependencies = {}
+                    formula_text = str(item.get('formula','') or '')
+                    for alias, dep_name in summary_alias_names.items():
+                        if re.search(r'(?<!\w)'+re.escape(alias)+r'(?!\w)', formula_text, flags=re.I):
+                            dependencies[alias] = _summary_value_by_name(dep_name)
+                    value = _safe_arithmetic(formula_text, dependencies)
+                _summary_cache[name] = value
+                return value
             finally:
-                try:
-                    if wb_com is not None:
-                        wb_com.Close(SaveChanges=True)
-                except Exception:
-                    pass
-                try:
-                    if excel is not None:
-                        excel.Quit()
-                except Exception:
-                    pass
-                pythoncom.CoUninitialize()
-            result = _read()
-        except Exception:
-            pass
-    return result
+                _summary_stack.discard(name)
+
+        result=[]
+        for ref in selected:
+            source_kind,_,raw_name=str(ref).partition(':')
+            if not raw_name: source_kind,raw_name='field',str(ref)
+            if source_kind=='summary':
+                item=summary_defs.get(raw_name,{})
+                value=None
+                # Preferisci un valore cached reale, se esiste.
+                for r in range(summary_row,ws.max_row+1):
+                    if str(ws.cell(r,1).value or '')==raw_name:
+                        value=ws.cell(r,2).value; break
+                if value is None:
+                    try:
+                        value=_summary_value_by_name(raw_name)
+                    except Exception: value=None
+                result.append({'field':ref,'label':raw_name,'kind':'summary','value':value,'format':''})
+                continue
+            if raw_name not in headers: continue
+            spec=definitions.get(raw_name,{}); ci=headers.index(raw_name)+1; kind=str(spec.get('final_formula','') or '').lower()
+            if kind in {'sum','count'}:
+                value=ws.cell(summary_row,ci).value
+                if value is None: value=aliases.get(('somma_' if kind=='sum' else 'conta_')+raw_name)
+                result.append({'field':ref,'label':raw_name,'kind':kind,'value':value,'format':str(spec.get('format','') or '')})
+            elif source_kind=='computed' or raw_name in computed_names:
+                value=None
+                for r in range(data_last_row,1,-1):
+                    candidate=ws.cell(r,ci).value
+                    if candidate not in (None,''): value=candidate; break
+                result.append({'field':ref,'label':raw_name,'kind':'computed','value':value,'format':str(spec.get('format','') or '')})
+        return result
+    finally:
+        wb_values.close(); wb_formulas.close()
 
 
 def _is_empty(value: Any) -> bool:
@@ -657,6 +769,21 @@ def _record_key_text(record: dict[str, Any], profile: dict[str, Any]) -> str:
     if not keys:
         return "nessuna chiave di riconciliazione"
     return ", ".join(f"{k}={_log_value(record.get(k))}" for k in keys)
+
+
+def _append_mail_uid_history(existing: Any, uid: Any) -> str:
+    """Aggiunge un UID alla cronologia testuale senza duplicati, preservando l'ordine."""
+    try:
+        uid_text = str(int(uid))
+    except (TypeError, ValueError):
+        uid_text = str(uid or "").strip()
+    if not uid_text:
+        return str(existing or "")
+    raw = str(existing or "").strip()
+    values = [x.strip() for x in re.split(r"[,;\s]+", raw) if x.strip()] if raw else []
+    if uid_text not in values:
+        values.append(uid_text)
+    return ", ".join(values)
 
 
 def apply_detailed_extractions(
@@ -738,15 +865,22 @@ def apply_detailed_extractions(
                 "Regole di selezione che hanno determinato il match:",
             ])
             for sr in selection:
-                lines.append(
-                    "  [MATCH] "
-                    f"{sr.get('name', '')} | origine={sr.get('source', '')} | "
-                    f"modalità={sr.get('mode', '')} | trigger={_log_value(sr.get('trigger', ''))}"
-                )
-                if sr.get("mode") == "regex" and sr.get("expanded_trigger") != sr.get("trigger"):
+                if str(sr.get("source", "") or "") == "date":
                     lines.append(
-                        f"          regex espansa={_log_value(sr.get('expanded_trigger', ''))}"
+                        "  [MATCH] "
+                        f"{sr.get('name', '')} | origine=data | modalità=intervallo | "
+                        f"da={_log_value(sr.get('valid_from', ''))} | a={_log_value(sr.get('valid_to', ''))}"
                     )
+                else:
+                    lines.append(
+                        "  [MATCH] "
+                        f"{sr.get('name', '')} | origine={sr.get('source', '')} | "
+                        f"modalità={sr.get('mode', '')} | trigger={_log_value(sr.get('trigger', ''))}"
+                    )
+                    if sr.get("mode") == "regex" and sr.get("expanded_trigger") != sr.get("trigger"):
+                        lines.append(
+                            f"          regex espansa={_log_value(sr.get('expanded_trigger', ''))}"
+                        )
 
             if not extracted_nonempty and not counter_fields:
                 lines.append("Riga Excel: nessuna (le regole di estrazione non hanno prodotto valori).")
@@ -781,6 +915,23 @@ def apply_detailed_extractions(
             lines.append(
                 f"Riga Excel: {excel_row} ({row_status}) | {_record_key_text(candidate, profile)}"
             )
+            # Campi tecnici UID: registrano tutte le mail che hanno creato o
+            # aggiornato questa riga. L'UID viene aggiunto una sola volta.
+            mail_uid = getattr(mail, "uid", None)
+            for uid_field, uid_spec in definitions.items():
+                if not bool(uid_spec.get("auto_mail_uids")):
+                    continue
+                old_uid_history = target.get(uid_field)
+                new_uid_history = _append_mail_uid_history(old_uid_history, mail_uid)
+                if new_uid_history != old_uid_history:
+                    target[uid_field] = new_uid_history
+                    stats["field_updates"] += 1
+                lines.extend([
+                    f"  [UID MAIL] campo={uid_field} | riga Excel={excel_row}",
+                    f"           UID corrente={_log_value(mail_uid)}",
+                    f"           valore prima={_log_value(old_uid_history)}",
+                    f"           valore dopo={_log_value(target.get(uid_field))}",
+                ])
             lines.append("Regole di estrazione e campi:")
 
             for upd in updates:

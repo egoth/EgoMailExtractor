@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from . import __version__
 
 import json
@@ -11,7 +13,7 @@ import sys
 import threading
 import time
 from email.utils import parsedate_to_datetime
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import webbrowser
 import tempfile
 import shutil
@@ -28,7 +30,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from .config import ConfigManager, ImapSettings
 from .debug_bundle import build_debug_bundle
 from .exporter import (
-    append_extraction_log, apply_detailed_extractions, final_formula_aliases,
+    append_extraction_log, apply_detailed_extractions, final_formula_aliases, summary_formula_aliases,
     expand_summary_formula, load_existing_records, merge_records, write_excel,
     read_excel_home_summary_values, summary_formula_display,
 )
@@ -41,7 +43,7 @@ from .extraction import (
     extract_rule_trace,
     humanize_extraction_rule,
     matching_mail_types,
-    matches_mail_type, header_prefilter_matches_profile,
+    matches_mail_type, header_prefilter_matches_profile, header_prefilter_matching_mail_types,
     reconcile,
 )
 from .mail import ImapService, MailHeader, MailMessage
@@ -62,7 +64,7 @@ from .profile import (
     slugify,
 )
 from .rule_builder import infer_rule_from_selection, propose_field_name
-from .regex_utils import expand_regex, set_regex_abbreviations, normalize_regex_abbreviations
+from .regex_utils import expand_regex, set_regex_abbreviations, normalize_regex_abbreviations, get_regex_abbreviations
 from .edition import IS_PRO, DISPLAY_NAME
 from .support_mail import SmtpSettings, infer_smtp_from_imap, send_support_email
 from .pipeline import atomic_write_json, read_json, header_to_dict, dict_to_header, event_to_dict, dict_to_event, safe_unlink, transactional_paths, prepare_transaction_source
@@ -81,7 +83,7 @@ class ExtractionRetryCancelled(RuntimeError):
     """L'utente ha scelto di non continuare i tentativi IMAP durante l'estrazione."""
 
 APP_VERSION = __version__
-APP_DATE = "31/08/2026"
+APP_DATE = "09/09/2026"
 APP_AUTHOR = ""
 APP_WEBSITE = "https://www.domoticachepassione.it/wp/acquista-egomailextractor-pro/"
 
@@ -269,6 +271,14 @@ def open_extraction_help(parent: tk.Misc | None = None) -> None:
     except Exception as exc:
         if parent:
             messagebox.showerror("Help", str(exc), parent=parent)
+
+
+def open_directory_help(parent: tk.Misc | None = None) -> None:
+    path = _resource_path("help", "organizzazione_directory.html")
+    try:
+        webbrowser.open(path.as_uri())
+    except Exception as exc:
+        messagebox.showerror("Help", f"Impossibile aprire lo schema delle directory:\n{path}\n\n{exc}", parent=parent)
 
 
 class HoverTip:
@@ -830,6 +840,7 @@ MATCH_SOURCE_LABELS = {
     "subject": "Oggetto",
     "sender": "Mittente",
     "body": "Corpo",
+    "date": "Data",
 }
 MATCH_SOURCE_FROM_LABEL = {v: k for k, v in MATCH_SOURCE_LABELS.items()}
 MATCH_MODE_LABELS = {
@@ -848,58 +859,164 @@ class MatchRuleEditorDialog(tk.Toplevel):
         self.result: dict | None = None
         self.title(title)
         self.resizable(False, False)
+
         source = str(rule.get("source", "subject"))
         mode = str(rule.get("mode", "contains"))
         self.name_var = tk.StringVar(value=str(rule.get("name", "")))
         self.source_var = tk.StringVar(value=MATCH_SOURCE_LABELS.get(source, "Oggetto"))
         self.mode_var = tk.StringVar(value=MATCH_MODE_LABELS.get(mode, "Contiene"))
         self.trigger_var = tk.StringVar(value=str(rule.get("trigger", "")))
+        self.valid_from_var = tk.StringVar(value=str(rule.get("valid_from", "") or ""))
+        self.valid_to_var = tk.StringVar(value=str(rule.get("valid_to", "") or ""))
 
         frm = ttk.Frame(self, padding=14)
         frm.pack(fill="both", expand=True)
         frm.columnconfigure(1, weight=1)
+
         ttk.Label(frm, text="Nome regola").grid(row=0, column=0, sticky="w", pady=5)
         ttk.Entry(frm, textvariable=self.name_var, width=52).grid(row=0, column=1, sticky="ew", pady=5)
+
         ttk.Label(frm, text="Dove cercare").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Combobox(
+        self.source_combo = ttk.Combobox(
             frm, textvariable=self.source_var,
             values=list(MATCH_SOURCE_FROM_LABEL), state="readonly", width=30
-        ).grid(row=1, column=1, sticky="ew", pady=5)
-        ttk.Label(frm, text="Tipo di match").grid(row=2, column=0, sticky="w", pady=5)
-        ttk.Combobox(
+        )
+        self.source_combo.grid(row=1, column=1, sticky="ew", pady=5)
+        self.source_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_source_ui())
+
+        self.mode_label = ttk.Label(frm, text="Tipo di match")
+        self.mode_label.grid(row=2, column=0, sticky="w", pady=5)
+        self.mode_combo = ttk.Combobox(
             frm, textvariable=self.mode_var,
             values=list(MATCH_MODE_FROM_LABEL), state="readonly", width=30
-        ).grid(row=2, column=1, sticky="ew", pady=5)
-        ttk.Label(frm, text="Trigger / match").grid(row=3, column=0, sticky="w", pady=5)
-        ttk.Entry(frm, textvariable=self.trigger_var, width=52).grid(row=3, column=1, sticky="ew", pady=5)
+        )
+        self.mode_combo.grid(row=2, column=1, sticky="ew", pady=5)
+
+        self.trigger_label = ttk.Label(frm, text="Trigger / match")
+        self.trigger_label.grid(row=3, column=0, sticky="w", pady=5)
+        self.trigger_entry = ttk.Entry(frm, textvariable=self.trigger_var, width=52)
+        self.trigger_entry.grid(row=3, column=1, sticky="ew", pady=5)
+
+        self.date_frame = ttk.LabelFrame(frm, text="Intervallo della data mail", padding=8)
+        self.date_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(7, 4))
+        ttk.Label(self.date_frame, text="Data da").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.date_frame, textvariable=self.valid_from_var, width=14).grid(
+            row=0, column=1, padx=(5, 18)
+        )
+        ttk.Label(self.date_frame, text="Data a").grid(row=0, column=2, sticky="w")
+        ttk.Entry(self.date_frame, textvariable=self.valid_to_var, width=14).grid(
+            row=0, column=3, padx=(5, 0)
+        )
         ttk.Label(
-            frm,
+            self.date_frame,
             text=(
-                "La regola seleziona la mail solo se il trigger è presente. "
-                "Per un tipo mail, tutte le regole con trigger compilato devono essere vere. "
-                "Se scegli Espressione regolare, il testo inserito viene interpretato come regex."
+                "Formato AAAA-MM-GG. Estremi inclusi. "
+                "Solo Data da = mail >= limite; solo Data a = mail <= limite."
             ),
-            wraplength=520, justify="left", foreground="#555555"
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 8))
+            foreground="#666666",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(5, 0))
+
+        self.help_var = tk.StringVar()
+        ttk.Label(
+            frm, textvariable=self.help_var,
+            wraplength=540, justify="left", foreground="#555555"
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 8))
+
         btns = ttk.Frame(frm)
-        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(btns, text="Annulla", command=self.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="Salva", command=self.save).pack(side="right")
+
+        self._sync_source_ui()
         self.transient(parent)
         self.grab_set()
         center_dialog_later(self, parent)
 
-    def save(self):
-        trigger = self.trigger_var.get().strip()
+    def _sync_source_ui(self):
         source = MATCH_SOURCE_FROM_LABEL.get(self.source_var.get(), "subject")
+        if source == "date":
+            self.mode_label.grid_remove()
+            self.mode_combo.grid_remove()
+            self.trigger_label.grid_remove()
+            self.trigger_entry.grid_remove()
+            self.date_frame.grid()
+            self.help_var.set(
+                "Questa è una regola di selezione per DATA. La data della mail deve "
+                "rientrare nell'intervallo indicato. La regola viene combinata in AND "
+                "con tutte le altre regole del Tipo mail."
+            )
+        else:
+            self.mode_label.grid()
+            self.mode_combo.grid()
+            self.trigger_label.grid()
+            self.trigger_entry.grid()
+            # Le date salvate da versioni precedenti restano nel JSON per
+            # compatibilità, ma non vengono proposte come parte della nuova UI.
+            self.date_frame.grid_remove()
+            self.help_var.set(
+                "La regola seleziona la mail se il trigger corrisponde. "
+                "Per un Tipo mail, tutte le regole compilate devono risultare vere (AND). "
+                "Con Espressione regolare il trigger viene interpretato come regex."
+            )
+
+    def save(self):
+        source = MATCH_SOURCE_FROM_LABEL.get(self.source_var.get(), "subject")
+        name = self.name_var.get().strip() or f"match_{source}"
+
+        if source == "date":
+            valid_from = self.valid_from_var.get().strip()
+            valid_to = self.valid_to_var.get().strip()
+            if not valid_from and not valid_to:
+                messagebox.showerror(
+                    "Intervallo data",
+                    "Per una regola Data devi compilare almeno Data da oppure Data a.",
+                    parent=self,
+                )
+                return
+            for label, value in (("Data da", valid_from), ("Data a", valid_to)):
+                if value:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError:
+                        messagebox.showerror(
+                            "Data non valida", f"{label}: usa AAAA-MM-GG", parent=self
+                        )
+                        return
+            if valid_from and valid_to and valid_from > valid_to:
+                messagebox.showerror(
+                    "Intervallo non valido",
+                    "Data da non può essere successiva a Data a.",
+                    parent=self,
+                )
+                return
+            self.result = {
+                "name": slugify(name, "match_data"),
+                "source": "date",
+                "mode": "range",
+                "trigger": "",
+            }
+            if valid_from:
+                self.result["valid_from"] = valid_from
+            if valid_to:
+                self.result["valid_to"] = valid_to
+            self.destroy()
+            return
+
+        trigger = self.trigger_var.get().strip()
         mode = MATCH_MODE_FROM_LABEL.get(self.mode_var.get(), "contains")
-        if mode == "regex" and trigger:
+        if not trigger:
+            messagebox.showerror(
+                "Trigger mancante",
+                "Inserisci il testo o la regex da cercare.",
+                parent=self,
+            )
+            return
+        if mode == "regex":
             try:
                 re.compile(expand_regex(trigger))
             except re.error as exc:
                 messagebox.showerror("Regex non valida", str(exc), parent=self)
                 return
-        name = self.name_var.get().strip() or f"match_{source}"
         self.result = {
             "name": slugify(name, f"match_{source}"),
             "source": source,
@@ -929,13 +1046,15 @@ class MatchRulesDialog(tk.Toplevel):
             ),
             wraplength=850, justify="left"
         ).pack(anchor="w", pady=(0, 8))
-        cols = ("name", "source", "mode", "trigger")
+        cols = ("name", "source", "mode", "valid_from", "valid_to", "trigger")
         self.tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse")
         for col, label, width in (
             ("name", "Regola", 180),
             ("source", "Match su", 110),
-            ("mode", "Modalità", 150),
-            ("trigger", "Trigger / valore da cercare", 420),
+            ("mode", "Modalità", 120),
+            ("valid_from", "Valida da", 95),
+            ("valid_to", "Valida fino a", 95),
+            ("trigger", "Trigger / valore da cercare", 340),
         ):
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width, stretch=True)
@@ -960,11 +1079,20 @@ class MatchRulesDialog(tk.Toplevel):
         for item in self.tree.get_children():
             self.tree.delete(item)
         for i, rule in enumerate(self.mail_type.setdefault("match_rules", [])):
+            source = str(rule.get("source", "body") or "body")
+            if source == "date":
+                mode_label = "Intervallo"
+                detail = "Data mail nell'intervallo"
+            else:
+                mode_label = MATCH_MODE_LABELS.get(rule.get("mode", "contains"), rule.get("mode", "contains"))
+                detail = rule.get("trigger", "")
             self.tree.insert("", "end", iid=str(i), values=(
                 rule.get("name", ""),
-                MATCH_SOURCE_LABELS.get(rule.get("source", "body"), rule.get("source", "body")),
-                MATCH_MODE_LABELS.get(rule.get("mode", "contains"), rule.get("mode", "contains")),
-                rule.get("trigger", ""),
+                MATCH_SOURCE_LABELS.get(source, source),
+                mode_label,
+                rule.get("valid_from", ""),
+                rule.get("valid_to", ""),
+                detail,
             ))
 
     def add_rule(self):
@@ -1006,6 +1134,7 @@ class MatchRulesDialog(tk.Toplevel):
 FIELD_TYPE_LABELS = {
     "text": "Testo",
     "date": "Data",
+    "datetime": "Data-Ora",
     "number": "Numero",
 }
 FIELD_LABEL_TO_TYPE = {v: k for k, v in FIELD_TYPE_LABELS.items()}
@@ -1035,10 +1164,31 @@ COMPUTED_PRIORITY_FROM_LABEL = {v: k for k, v in COMPUTED_PRIORITY_LABELS.items(
 class RuleEditorDialog(tk.Toplevel):
     """Editor completo di una regola di estrazione con anteprima live."""
 
-    TRANSFORMS = (
-        "text", "upper", "int", "money", "guest_count", "date_it_email_year"
-    )
-    STRATEGIES = ("regex", "after_trigger", "constant")
+    TRANSFORM_LABELS = {
+        "text": "Testo",
+        "upper": "Maiuscolo",
+        "int": "Intero",
+        "money": "Importo",
+        "guest_count": "Numero ospiti",
+        "date_it_email_year": "Data europea + anno email",
+        "date_eu": "Data europea (GG/MM/AAAA)",
+        "datetime_eu": "Data e ora europea (GG/MM/AAAA HH:MM[:SS[.fff]])",
+        "date_us": "Data USA (MM/GG/AAAA)",
+        "datetime_us": "Data e ora USA (MM/GG/AAAA HH:MM[:SS[.fff]])",
+        "date_us_to_eu": "Data USA → Europea (MM/GG/AAAA → GG/MM/AAAA)",
+        "date_eu_to_us": "Data Europea → USA (GG/MM/AAAA → MM/GG/AAAA)",
+    }
+    TRANSFORM_FROM_LABEL = {v: k for k, v in TRANSFORM_LABELS.items()}
+    TRANSFORMS = tuple(TRANSFORM_LABELS)
+    TRANSFORM_CHOICES = tuple(TRANSFORM_LABELS.values())
+    STRATEGY_LABELS = {
+        "regex": "Regex",
+        "after_trigger": "Dopo trigger",
+        "constant": "Valore costante",
+        "email_date": "Data della mail",
+    }
+    STRATEGY_FROM_LABEL = {v: k for k, v in STRATEGY_LABELS.items()}
+    STRATEGIES = tuple(STRATEGY_LABELS.values())
     SOURCES = EXTRACTION_SOURCES
 
     def __init__(
@@ -1055,8 +1205,8 @@ class RuleEditorDialog(tk.Toplevel):
         self.current_mail = current_mail
         self.result: dict | None = None
         self.title(title)
-        self.geometry("840x830")
-        self.minsize(760, 740)
+        self.geometry("860x760")
+        self.minsize(720, 500)
 
         field_name = str(rule.get("field", ""))
         field_spec = get_field(profile, field_name) or {"type": "text"}
@@ -1067,8 +1217,10 @@ class RuleEditorDialog(tk.Toplevel):
             "field": tk.StringVar(value=field_name),
             "field_type": tk.StringVar(value=type_label),
             "source": tk.StringVar(value=str(rule.get("source", "body"))),
-            "strategy": tk.StringVar(value=str(rule.get("strategy", "regex"))),
-            "transform": tk.StringVar(value=str(rule.get("transform", "text"))),
+            "strategy": tk.StringVar(value=self.STRATEGY_LABELS.get(str(rule.get("strategy", "regex")), str(rule.get("strategy", "regex")))),
+            "transform": tk.StringVar(
+                value=self.TRANSFORM_LABELS.get(str(rule.get("transform", "text")), str(rule.get("transform", "text")))
+            ),
             "pattern": tk.StringVar(value=str(rule.get("pattern", ""))),
             "trigger": tk.StringVar(value=str(rule.get("trigger", ""))),
             "value_pattern": tk.StringVar(value=str(rule.get("value_pattern", ""))),
@@ -1084,13 +1236,33 @@ class RuleEditorDialog(tk.Toplevel):
                     "Sostituisci",
                 )
             ),
+            "valid_from": tk.StringVar(value=str(rule.get("valid_from", "") or "")),
+            "valid_to": tk.StringVar(value=str(rule.get("valid_to", "") or "")),
         }
         self.human_var = tk.StringVar()
         self.application_var = tk.StringVar()
 
-        outer = ttk.Frame(self, padding=12)
-        outer.pack(fill="both", expand=True)
+        # Il contenuto può superare l'altezza disponibile: lo rendiamo
+        # scorrevole, lasciando Salva/Annulla sempre visibili in basso.
+        shell = ttk.Frame(self)
+        shell.pack(fill="both", expand=True)
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(0, weight=1)
+        content_host = ttk.Frame(shell)
+        content_host.grid(row=0, column=0, sticky="nsew")
+        canvas = tk.Canvas(content_host, highlightthickness=0, borderwidth=0)
+        vscroll = ttk.Scrollbar(content_host, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+        outer = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=outer, anchor="nw")
         outer.columnconfigure(1, weight=1)
+        outer.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(canvas_window, width=e.width))
+        self.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        self.bind("<Button-4>", lambda _e: canvas.yview_scroll(-1, "units"))
+        self.bind("<Button-5>", lambda _e: canvas.yview_scroll(1, "units"))
 
         row = 0
         ttk.Label(outer, text="Nome regola").grid(row=row, column=0, sticky="w", pady=4)
@@ -1130,6 +1302,21 @@ class RuleEditorDialog(tk.Toplevel):
         self._sync_policy_choices()
         self.field_type_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_policy_choices())
 
+        validity = ttk.LabelFrame(outer, text="Validità della regola rispetto alla data della mail", padding=8)
+        validity.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(5, 8))
+        validity.columnconfigure(1, weight=1)
+        validity.columnconfigure(3, weight=1)
+        ttk.Label(validity, text="Data inizio").grid(row=0, column=0, sticky="w")
+        ttk.Entry(validity, textvariable=self.vars["valid_from"], width=14).grid(row=0, column=1, sticky="w", padx=(5, 18))
+        ttk.Label(validity, text="Data fine").grid(row=0, column=2, sticky="w")
+        ttk.Entry(validity, textvariable=self.vars["valid_to"], width=14).grid(row=0, column=3, sticky="w", padx=(5, 0))
+        ttk.Label(
+            validity,
+            text="Formato AAAA-MM-GG. Estremi inclusi; lascia vuoto un estremo per non porre quel limite.",
+            foreground="#666666",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(5, 0))
+        row += 1
+
         ttk.Separator(outer).grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
         row += 1
 
@@ -1140,11 +1327,26 @@ class RuleEditorDialog(tk.Toplevel):
         ttk.Combobox(outer, textvariable=self.vars["strategy"], values=self.STRATEGIES, state="readonly").grid(row=row, column=1, sticky="ew", pady=4)
         row += 1
         ttk.Label(outer, text="Conversione valore").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(outer, textvariable=self.vars["transform"], values=self.TRANSFORMS, state="readonly").grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Combobox(outer, textvariable=self.vars["transform"], values=self.TRANSFORM_CHOICES, state="readonly").grid(row=row, column=1, sticky="ew", pady=4)
         row += 1
 
         ttk.Label(outer, text="Regex").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(outer, textvariable=self.vars["pattern"]).grid(row=row, column=1, sticky="ew", pady=4)
+        self.pattern_entry = ttk.Entry(outer, textvariable=self.vars["pattern"])
+        self.pattern_entry.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        regex_box = ttk.LabelFrame(outer, text="Abbreviazioni Regex", padding=6)
+        regex_box.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 7))
+        regex_box.columnconfigure(0, weight=1)
+        self.regex_alias_list = tk.Listbox(regex_box, height=4, exportselection=False)
+        self.regex_alias_list.grid(row=0, column=0, sticky="ew")
+        regex_scroll = ttk.Scrollbar(regex_box, orient="vertical", command=self.regex_alias_list.yview)
+        regex_scroll.grid(row=0, column=1, sticky="ns")
+        self.regex_alias_list.configure(yscrollcommand=regex_scroll.set)
+        ttk.Button(regex_box, text="+ Nuova abbreviazione…", command=self._add_regex_abbreviation).grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Label(regex_box, text="Clic su un token: lo inserisce nella Regex al punto del cursore.", foreground="#666666").grid(row=1, column=0, sticky="e", pady=(5, 0))
+        self.regex_alias_list.bind("<ButtonRelease-1>", self._insert_regex_abbreviation)
+        self._refresh_regex_abbreviations()
         row += 1
         ttk.Label(outer, text="Trigger").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.vars["trigger"]).grid(row=row, column=1, sticky="ew", pady=4)
@@ -1178,8 +1380,10 @@ class RuleEditorDialog(tk.Toplevel):
         ttk.Label(application_box, textvariable=self.application_var, wraplength=770, justify="left").pack(fill="x")
         row += 1
 
-        btns = ttk.Frame(outer)
-        btns.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        # Barra azioni fissa: non scorre mai fuori dalla finestra.
+        ttk.Separator(shell, orient="horizontal").grid(row=1, column=0, sticky="ew")
+        btns = ttk.Frame(shell, padding=(12, 8))
+        btns.grid(row=2, column=0, sticky="ew")
         ttk.Button(btns, text="Help regole…", command=lambda: open_extraction_help(self)).pack(side="left")
         ttk.Button(btns, text="Annulla", command=self.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="Salva regola", command=self.save).pack(side="right")
@@ -1191,9 +1395,60 @@ class RuleEditorDialog(tk.Toplevel):
                 pass
         self.after_idle(self._update_live_preview)
 
+        # La finestra Nuova/Modifica regola resta centrata rispetto alla
+        # finestra Regole di estrazione che l'ha aperta.
         self.transient(parent)
         self.grab_set()
         center_dialog_later(self, parent)
+
+    def _find_config_manager(self):
+        cur = self.master
+        while cur is not None:
+            mgr = getattr(cur, "config_mgr", None)
+            if mgr is not None:
+                return mgr
+            cur = getattr(cur, "master", None)
+        return None
+
+    def _refresh_regex_abbreviations(self):
+        if not hasattr(self, "regex_alias_list"):
+            return
+        self.regex_alias_list.delete(0, "end")
+        for item in get_regex_abbreviations():
+            self.regex_alias_list.insert("end", str(item.get("token", "")))
+
+    def _insert_regex_abbreviation(self, event=None):
+        try:
+            idx = self.regex_alias_list.nearest(event.y) if event is not None else self.regex_alias_list.curselection()[0]
+            token = str(self.regex_alias_list.get(idx) or "")
+        except Exception:
+            return
+        if not token:
+            return
+        try:
+            pos = self.pattern_entry.index(tk.INSERT)
+            self.pattern_entry.insert(pos, token)
+            self.pattern_entry.focus_set()
+        except Exception:
+            pass
+
+    def _add_regex_abbreviation(self):
+        token = simpledialog.askstring("Nuova abbreviazione Regex", "Token (es. --CODICE--):", parent=self)
+        if not token:
+            return
+        replacement = simpledialog.askstring("Nuova abbreviazione Regex", "Regex sostitutiva:", parent=self)
+        if replacement is None:
+            return
+        mgr = self._find_config_manager()
+        current = get_regex_abbreviations()
+        current = [x for x in current if str(x.get("token", "")) != token.strip()]
+        current.append({"token": token.strip(), "replacement": replacement})
+        normalized = normalize_regex_abbreviations(current)
+        set_regex_abbreviations(normalized)
+        if mgr is not None:
+            mgr.data["regex_abbreviations"] = normalized
+            mgr.save()
+        self._refresh_regex_abbreviations()
 
     def _sync_policy_choices(self):
         field_type = FIELD_LABEL_TO_TYPE.get(self.vars["field_type"].get(), "text")
@@ -1216,7 +1471,8 @@ class RuleEditorDialog(tk.Toplevel):
     def _rule_from_vars(self, validate: bool = False) -> dict:
         name = self.vars["name"].get().strip()
         field_name = slugify(self.vars["field"].get(), "campo")
-        strategy = self.vars["strategy"].get() or "regex"
+        strategy_raw = self.vars["strategy"].get() or self.STRATEGY_LABELS["regex"]
+        strategy = self.STRATEGY_FROM_LABEL.get(strategy_raw, strategy_raw)
         pattern = self.vars["pattern"].get().strip()
         trigger = self.vars["trigger"].get().strip()
         value_pattern = self.vars["value_pattern"].get().strip()
@@ -1234,17 +1490,36 @@ class RuleEditorDialog(tk.Toplevel):
                 raise ValueError("Per after_trigger devi specificare il Trigger")
             if value_pattern:
                 re.compile(expand_regex(value_pattern))
+            valid_from = self.vars["valid_from"].get().strip()
+            valid_to = self.vars["valid_to"].get().strip()
+            for label, value in (("Data inizio", valid_from), ("Data fine", valid_to)):
+                if value:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError:
+                        raise ValueError(f"{label}: usa il formato AAAA-MM-GG")
+            if valid_from and valid_to and valid_from > valid_to:
+                raise ValueError("La Data inizio non può essere successiva alla Data fine")
 
         rule = {
             "name": name or "regola",
             "field": field_name,
             "source": self.vars["source"].get() or "body",
             "strategy": strategy,
-            "transform": self.vars["transform"].get() or "text",
+            "transform": self.TRANSFORM_FROM_LABEL.get(
+                self.vars["transform"].get(), self.vars["transform"].get() or "text"
+            ),
             "existing_value_policy": UPDATE_POLICY_FROM_LABEL.get(
                 self.vars["existing_value_policy"].get(), "replace"
             ),
         }
+        valid_from = self.vars["valid_from"].get().strip()
+        valid_to = self.vars["valid_to"].get().strip()
+        if valid_from:
+            rule["valid_from"] = valid_from
+        if valid_to:
+            rule["valid_to"] = valid_to
+
         occurrence = self._safe_int("occurrence", 1)
         if occurrence != 1:
             rule["occurrence"] = occurrence
@@ -1331,8 +1606,14 @@ class FieldEditorDialog(tk.Toplevel):
         self.name_var = tk.StringVar(value=self.field.get("name", ""))
         self.type_var = tk.StringVar(value=FIELD_TYPE_LABELS[normalize_field_type(self.field.get("type"))])
         self.currency_var = tk.BooleanVar(value=self.field.get("format") == "currency_eur")
+        try:
+            initial_decimals = max(0, min(10, int(self.field.get("decimals", 2))))
+        except (TypeError, ValueError):
+            initial_decimals = 2
+        self.decimals_var = tk.IntVar(value=initial_decimals)
         self.key_var = tk.BooleanVar(value=self.field.get("name") in profile.get("reconcile_keys", []))
         self.mail_type_counter_var = tk.StringVar(value=str(self.field.get("mail_type_counter", "") or ""))
+        self.auto_mail_uids_var = tk.BooleanVar(value=bool(self.field.get("auto_mail_uids")))
         self.final_formula_var = tk.StringVar(
             value=FINAL_FORMULA_LABELS.get(str(self.field.get("final_formula", "") or "").lower(), "Nessuna")
         )
@@ -1342,8 +1623,10 @@ class FieldEditorDialog(tk.Toplevel):
         ttk.Label(frm, text="Tipo cella Excel").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Combobox(frm, textvariable=self.type_var, values=list(FIELD_LABEL_TO_TYPE), state="readonly", width=20).grid(row=1, column=1, sticky="w", pady=4)
         ttk.Checkbutton(frm, text="Formato valuta €", variable=self.currency_var).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(frm, text="Chiave di riconciliazione", variable=self.key_var).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(frm, text="Contatore riscontri Tipo mail").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(frm, text="Cifre decimali").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frm, from_=0, to=10, textvariable=self.decimals_var, width=6).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(frm, text="Chiave di riconciliazione", variable=self.key_var).grid(row=4, column=1, sticky="w", pady=4)
+        ttk.Label(frm, text="Contatore riscontri Tipo mail").grid(row=5, column=0, sticky="w", pady=4)
         mail_type_names = [
             str(mt.get("name", "")) for mt in profile.get("mail_types", [])
             if isinstance(mt, dict) and mt.get("name")
@@ -1352,7 +1635,7 @@ class FieldEditorDialog(tk.Toplevel):
             frm, textvariable=self.mail_type_counter_var,
             values=[""] + mail_type_names, state="readonly", width=28,
         )
-        self.mail_type_counter_combo.grid(row=4, column=1, sticky="w", pady=4)
+        self.mail_type_counter_combo.grid(row=5, column=1, sticky="w", pady=4)
         self.mail_type_counter_combo.bind(
             "<<ComboboxSelected>>",
             lambda _e: self.type_var.set("Numero") if self.mail_type_counter_var.get().strip() else None,
@@ -1361,18 +1644,27 @@ class FieldEditorDialog(tk.Toplevel):
             frm,
             text="Se impostato: 1 al primo match sulla riga, poi 2, 3, ...; il campo deve essere Numero.",
             foreground="#555555",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        ttk.Label(frm, text="Formula finale Excel").grid(row=6, column=0, sticky="w", pady=4)
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Checkbutton(
+            frm, text="Popola automaticamente con gli UID delle email che aggiornano la riga",
+            variable=self.auto_mail_uids_var,
+            command=lambda: self.type_var.set("Testo") if self.auto_mail_uids_var.get() else None,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Label(
+            frm, text="Gli UID vengono aggiunti una sola volta, separati da virgola, quando una mail crea o aggiorna la riga.",
+            foreground="#555555",
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(frm, text="Formula finale Excel").grid(row=9, column=0, sticky="w", pady=4)
         ttk.Combobox(
             frm, textvariable=self.final_formula_var,
             values=list(FINAL_FORMULA_FROM_LABEL), state="readonly", width=20,
-        ).grid(row=6, column=1, sticky="w", pady=4)
+        ).grid(row=9, column=1, sticky="w", pady=4)
         ttk.Label(
             frm,
             text="Somma: solo campi Numero. Conta: conta le celle non vuote della colonna.",
             foreground="#555555",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        btns = ttk.Frame(frm); btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(10,0))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        btns = ttk.Frame(frm); btns.grid(row=11, column=0, columnspan=2, sticky="e", pady=(10,0))
         ttk.Button(btns, text="Annulla", command=self.destroy).pack(side="right", padx=(6,0))
         ttk.Button(btns, text="Salva", command=self.save).pack(side="right")
         self.transient(parent); self.grab_set(); center_dialog_later(self, parent)
@@ -1390,6 +1682,13 @@ class FieldEditorDialog(tk.Toplevel):
                 parent=self,
             )
             return
+        if self.auto_mail_uids_var.get() and field_type != "text":
+            messagebox.showerror(
+                "UID email",
+                "Il campo UID email deve essere di tipo Testo.",
+                parent=self,
+            )
+            return
         final_formula = FINAL_FORMULA_FROM_LABEL.get(self.final_formula_var.get(), "")
         if final_formula == "sum" and field_type != "number":
             messagebox.showerror(
@@ -1399,14 +1698,22 @@ class FieldEditorDialog(tk.Toplevel):
             )
             return
         result = {"name": name, "type": field_type}
+        if field_type == "number":
+            try:
+                result["decimals"] = max(0, min(10, int(self.decimals_var.get())))
+            except (TypeError, ValueError, tk.TclError):
+                result["decimals"] = 2
         if self.currency_var.get() and field_type == "number":
             result["format"] = "currency_eur"
         if mail_type_counter:
             result["mail_type_counter"] = mail_type_counter
+        if self.auto_mail_uids_var.get():
+            result["auto_mail_uids"] = True
         if final_formula:
             result["final_formula"] = final_formula
         self.result = result
         self.destroy()
+
 
 
 
@@ -1528,7 +1835,7 @@ class ComputedFieldEditorDialog(tk.Toplevel):
         all_names = [str(f.get("name")) for f in fields]
         date_names = [
             str(f.get("name")) for f in fields
-            if normalize_field_type(f.get("type")) == "date"
+            if normalize_field_type(f.get("type")) in {"date", "datetime"}
         ]
         number_names = [
             str(f.get("name")) for f in fields
@@ -1916,7 +2223,7 @@ class SummaryFormulaEditorDialog(tk.Toplevel):
         ]
         date_fields = [
             str(f.get("name")) for f in profile.get("fields", []) or []
-            if isinstance(f, dict) and f.get("name") and normalize_field_type(f.get("type")) == "date"
+            if isinstance(f, dict) and f.get("name") and normalize_field_type(f.get("type")) in {"date", "datetime"}
         ]
 
         frm = ttk.Frame(self, padding=12)
@@ -1941,19 +2248,34 @@ class SummaryFormulaEditorDialog(tk.Toplevel):
         self.formula_entry.grid(row=0, column=1, sticky="ew", pady=4)
 
         aliases = sorted(final_formula_aliases(profile))
-        alias_box = ttk.LabelFrame(self.formula_frame, text="Alias disponibili dai campi con Formula finale", padding=8)
+        current_formula_name = str(self.item.get("name", "") or "").strip()
+        summary_alias_map = summary_formula_aliases(profile)
+        summary_aliases = sorted(
+            alias for alias, formula_name in summary_alias_map.items()
+            if formula_name != current_formula_name
+        )
+        all_aliases = aliases + summary_aliases
+        alias_box = ttk.LabelFrame(
+            self.formula_frame,
+            text="Alias disponibili: campi con Formula finale + formule riepilogative",
+            padding=8,
+        )
         alias_box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 4))
         alias_list = tk.Listbox(alias_box, height=6, exportselection=False)
         alias_scroll = ttk.Scrollbar(alias_box, orient="vertical", command=alias_list.yview)
         alias_list.configure(yscrollcommand=alias_scroll.set)
         alias_list.pack(side="left", fill="both", expand=True)
         alias_scroll.pack(side="right", fill="y")
-        if aliases:
+        if all_aliases:
             for alias in aliases:
+                alias_list.insert("end", alias)
+            if aliases and summary_aliases:
+                alias_list.insert("end", "──────── formule riepilogative ────────")
+            for alias in summary_aliases:
                 alias_list.insert("end", alias)
             alias_list.bind("<ButtonRelease-1>", self._insert_alias_from_click)
         else:
-            alias_list.insert("end", "Nessun alias disponibile. Imposta Somma o Conta in almeno un campo.")
+            alias_list.insert("end", "Nessun alias disponibile.")
             alias_list.configure(state="disabled")
         self.alias_list = alias_list
 
@@ -2025,7 +2347,7 @@ class SummaryFormulaEditorDialog(tk.Toplevel):
             alias = str(self.alias_list.get(index) or "").strip()
         except Exception:
             return
-        if not alias or alias.startswith("Nessun alias"):
+        if not alias or alias.startswith("Nessun alias") or alias.startswith("────────"):
             return
         try:
             self.formula_entry.focus_set()
@@ -2069,7 +2391,13 @@ class SummaryFormulaEditorDialog(tk.Toplevel):
             formula = "=" + formula
         try:
             aliases = final_formula_aliases(self.profile)
+            summary_alias_map = summary_formula_aliases(self.profile)
+            current_name = str(self.item.get("name", "") or "").strip()
             fake_cells = {alias: "A1" for alias in aliases}
+            fake_cells.update({
+                alias: "B1" for alias, formula_name in summary_alias_map.items()
+                if formula_name != current_name
+            })
             expand_summary_formula(formula, self.profile, fake_cells)
         except Exception as exc:
             messagebox.showerror("Formula riepilogativa", str(exc), parent=self)
@@ -2099,7 +2427,8 @@ class SummaryFormulasDialog(tk.Toplevel):
         self.tree.pack(fill="both", expand=True)
 
         aliases = sorted(final_formula_aliases(profile))
-        aliases_text = ", ".join(aliases) if aliases else "nessuno"
+        summary_alias_list = sorted(summary_formula_aliases(profile))
+        aliases_text = ", ".join(aliases + summary_alias_list) if (aliases or summary_alias_list) else "nessuno"
         ttk.Label(
             frm,
             text=f"Alias disponibili: {aliases_text}",
@@ -2214,6 +2543,7 @@ class MainWindow(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.stop_event = threading.Event()
+        self.search_generation = 0
         # Evento separato per interrompere l'estrazione senza interferire con la ricerca IMAP.
         self.extraction_stop_event = threading.Event()
         self.extraction_running = False
@@ -2233,7 +2563,11 @@ class MainWindow(tk.Tk):
 
         self.subject_var = tk.StringVar()
         self.sender_var = tk.StringVar()
+        self.uid_search_var = tk.StringVar()
         self.folder_var = tk.StringVar(value=config.imap.folder)
+        self.search_order_var = tk.StringVar(value="Più recenti prima")
+        self.search_from_var = tk.StringVar()
+        self.search_to_var = tk.StringVar()
         self.imap_profile_var = tk.StringVar(value=config.active_imap_profile_name or "<nessuna email>")
         self.status_var = tk.StringVar(value="Pronto")
         self.mail_type_var = tk.StringVar()
@@ -2353,6 +2687,8 @@ class MainWindow(tk.Tk):
         profm.add_command(label="Nuovo tipo mail dal messaggio", command=self.create_mail_type)
         profm.add_command(label="Rinomina tipo mail…", command=self.rename_current_mail_type)
         profm.add_command(label="Elimina tipo mail…", command=self.delete_current_mail_type)
+        profm.add_command(label="Sposta tipo mail prima", command=lambda: self.move_current_mail_type(-1))
+        profm.add_command(label="Sposta tipo mail dopo", command=lambda: self.move_current_mail_type(1))
         profm.add_separator()
         profm.add_command(label="Regole selezione mail…", command=self.edit_mail_type_criteria)
         profm.add_command(label="Regole di estrazione…", command=self.manage_rules)
@@ -2369,6 +2705,7 @@ class MainWindow(tk.Tk):
 
         helpm = tk.Menu(menu, tearoff=False)
         helpm.add_command(label="Regole di estrazione…", command=lambda: open_extraction_help(self))
+        helpm.add_command(label="Organizzazione file e directory…", command=lambda: open_directory_help(self))
         helpm.add_command(label="Richiedi assistenza via email…", command=self.request_support_email)
         helpm.add_command(label="Licenza…", command=self.open_license)
         helpm.add_separator()
@@ -2391,6 +2728,19 @@ class MainWindow(tk.Tk):
         ttk.Button(top, text="Interrompi", command=self.stop_search).grid(row=0, column=9, padx=3)
         top.columnconfigure(1, weight=1)
         top.columnconfigure(3, weight=1)
+        ttk.Label(top, text="Ordine").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            top, textvariable=self.search_order_var,
+            values=["Più recenti prima", "Più vecchie prima"],
+            state="readonly", width=20,
+        ).grid(row=1, column=1, sticky="w", padx=(4, 12), pady=(6, 0))
+        ttk.Label(top, text="Data da").grid(row=1, column=2, sticky="e", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.search_from_var, width=13).grid(row=1, column=3, sticky="w", padx=(4, 12), pady=(6, 0))
+        ttk.Label(top, text="Data a").grid(row=1, column=4, sticky="e", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.search_to_var, width=13).grid(row=1, column=5, sticky="w", padx=(4, 12), pady=(6, 0))
+        ttk.Label(top, text="UID").grid(row=1, column=6, sticky="e", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.uid_search_var, width=12).grid(row=1, column=7, sticky="w", padx=(4, 12), pady=(6, 0))
+        ttk.Label(top, text="Date: AAAA-MM-GG · UID numerico (facoltativi)").grid(row=1, column=8, columnspan=2, sticky="w", pady=(6, 0))
 
         # Pannello messaggi applicazione: viene riservato prima del PanedWindow,
         # così non scompare quando la finestra viene ridotta. Conserva lo
@@ -2489,9 +2839,7 @@ class MainWindow(tk.Tk):
         )
         self.mail_type_combo.pack(side="left", padx=(4, 10))
         self.mail_type_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_extraction_preview())
-        ttk.Button(tools_top, text="Nuovo tipo", command=self.create_mail_type).pack(side="left", padx=2)
-        ttk.Button(tools_top, text="Rinomina", command=self.rename_current_mail_type).pack(side="left", padx=2)
-        ttk.Button(tools_top, text="Elimina", command=self.delete_current_mail_type).pack(side="left", padx=2)
+        ttk.Button(tools_top, text="Cambia priorità…", command=self.manage_mail_type_priority).pack(side="left", padx=2)
         ttk.Button(tools_top, text="Selezione mail…", command=self.edit_mail_type_criteria).pack(side="left", padx=2)
         ttk.Button(tools_top, text="Regole estrazione…", command=self.manage_rules).pack(side="left", padx=2)
         ttk.Button(tools_top, text="Campi…", command=self.manage_fields).pack(side="left", padx=2)
@@ -2660,13 +3008,14 @@ class MainWindow(tk.Tk):
         if isinstance(value, bool):
             value = int(value)
         if isinstance(value, (int, float)):
+            try:
+                decimals = max(0, min(10, int(spec.get("decimals", 2))))
+            except (TypeError, ValueError):
+                decimals = 2
             if str(spec.get("format", "") or "") == "currency_eur":
-                # Formato italiano leggibile nella home.
-                txt = f"{float(value):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+                txt = f"{float(value):,.{decimals}f}".replace(",", "§").replace(".", ",").replace("§", ".")
                 return txt + " €"
-            if isinstance(value, float) and not value.is_integer():
-                return (f"{value:.2f}".rstrip("0").rstrip(".")).replace(".", ",")
-            return str(int(value))
+            return f"{float(value):.{decimals}f}".replace(".", ",")
         return str(value)
 
     @staticmethod
@@ -2714,7 +3063,9 @@ class MainWindow(tk.Tk):
             fmt_spec = definitions.get(raw_name, {})
             if source_kind == "summary":
                 label = raw_name
-                if str(summary_defs.get(raw_name, {}).get("kind", "") or "") == "period_aggregate":
+                summary_item = summary_defs.get(raw_name, {})
+                if str(summary_item.get("kind", "") or "") == "period_aggregate":
+                    fmt_spec = definitions.get(str(summary_item.get("field", "") or ""), {})
                     label = raw_name
             elif source_kind == "computed":
                 label = raw_name.replace("_", " ")
@@ -2889,6 +3240,17 @@ class MainWindow(tk.Tk):
         self._recompute_cached_matches()
 
     def _configure_tree_columns(self):
+        # Conserva le larghezze regolate manualmente dall'utente: questa funzione
+        # viene richiamata durante la ricerca e il ricalcolo dei Tipi mail.
+        previous_widths = {}
+        if hasattr(self, "tree"):
+            for _col in ("sender", "subject"):
+                try:
+                    _width = int(self.tree.column(_col, "width") or 0)
+                    if _width > 0:
+                        previous_widths[_col] = _width
+                except Exception:
+                    pass
         base = ("sel", "uid", "date", "sender", "subject")
         self.mail_type_columns = [
             (f"mailtype_{i}", str(mt.get("name", "")))
@@ -2900,13 +3262,16 @@ class MainWindow(tk.Tk):
             ("sel", "Sel.", 45, False),
             ("uid", "UID", 70, False),
             ("date", "Data", 190, False),
-            ("sender", "Mittente", 300, True),
-            ("subject", "Oggetto", 560, True),
+            ("sender", "Mittente", 300, False),
+            ("subject", "Oggetto", 560, False),
         ]:
             self.tree.heading(col, text=text)
-            self.tree.column(col, width=width, stretch=stretch, anchor="w")
-        for col_id, name in self.mail_type_columns:
-            label = f"✓ {name}" if name in self.filter_mail_types else name
+            self.tree.column(
+                col, width=previous_widths.get(col, width), stretch=stretch, anchor="w"
+            )
+        for priority, (col_id, name) in enumerate(self.mail_type_columns, 1):
+            base_label = f"{priority}. {name}"
+            label = f"✓ {base_label}" if name in self.filter_mail_types else base_label
             self.tree.heading(
                 col_id, text=label,
                 command=lambda n=name: self.filter_by_mail_type(n)
@@ -2957,9 +3322,12 @@ class MainWindow(tk.Tk):
                 )
                 if body_needed and uid not in self.messages:
                     missing_body = True
-                    continue
+                    # Senza corpo non possiamo stabilire se questo Tipo (più prioritario)
+                    # vince: non assegniamo provvisoriamente un Tipo successivo.
+                    break
                 if matches_mail_type(source, mt):
                     names.add(str(mt.get("name", "")))
+                    break
             self.row_matches[uid] = names
         self._configure_tree_columns()
         self._rebuild_tree_rows()
@@ -3003,7 +3371,9 @@ class MainWindow(tk.Tk):
             while True:
                 kind, payload = self.ui_queue.get_nowait()
                 if kind == "search_item":
-                    item, match_names = payload
+                    generation, item, match_names = payload
+                    if generation != self.search_generation:
+                        continue
                     self.headers[item.uid] = item
                     if isinstance(item, MailMessage):
                         self.messages[item.uid] = item
@@ -3013,8 +3383,21 @@ class MainWindow(tk.Tk):
                     if self._row_visible(item.uid):
                         self.tree.insert("", "end", iid=str(item.uid), values=self._tree_values(item.uid))
                 elif kind == "progress":
-                    i, total = payload
+                    generation, i, total = payload
+                    if generation != self.search_generation:
+                        continue
                     self.status_var.set(f"Ricerca: {i}/{total} — trovate {len(self.headers)}")
+                elif kind == "search_done":
+                    generation, message = payload
+                    if generation != self.search_generation:
+                        continue
+                    self.status_var.set(message)
+                elif kind == "search_error":
+                    generation, error = payload
+                    if generation != self.search_generation:
+                        continue
+                    self.status_var.set("Errore ricerca")
+                    messagebox.showerror("Errore ricerca", str(error), parent=self)
                 elif kind == "extraction_phase_progress":
                     if len(payload) >= 5:
                         phase, current, total, profile_name, phase_extra = payload[:5]
@@ -3118,7 +3501,42 @@ class MainWindow(tk.Tk):
             self.wait_window(dlg)
             if not self.config_mgr.get_password():
                 return
-        self.stop_event.clear()
+        try:
+            search_from = date.fromisoformat(self.search_from_var.get().strip()) if self.search_from_var.get().strip() else None
+            search_to = date.fromisoformat(self.search_to_var.get().strip()) if self.search_to_var.get().strip() else None
+        except ValueError:
+            messagebox.showerror("Intervallo date", "Usa il formato AAAA-MM-GG.", parent=self)
+            return
+        if search_from and search_to and search_from > search_to:
+            messagebox.showerror("Intervallo date", "La Data da non può essere successiva alla Data a.", parent=self)
+            return
+        uid_text = self.uid_search_var.get().strip()
+        search_uid = None
+        if uid_text:
+            try:
+                search_uid = int(uid_text)
+                if search_uid <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Ricerca UID", "L'UID deve essere un numero intero positivo.", parent=self)
+                return
+        search_order = "asc" if self.search_order_var.get() == "Più vecchie prima" else "desc"
+
+        # Ogni ricerca possiede il proprio evento e una generazione. Avviarne una
+        # nuova ferma quella precedente; gli eventi GUI tardivi della vecchia
+        # ricerca vengono ignorati e non possono più mescolarsi ai nuovi risultati.
+        try:
+            self.stop_event.set()
+        except Exception:
+            pass
+        self.search_generation += 1
+        generation = self.search_generation
+        search_stop_event = threading.Event()
+        self.stop_event = search_stop_event
+
+        folder = self.folder_var.get().strip() or "INBOX"
+        subject = self.subject_var.get()
+        sender = self.sender_var.get()
         self.headers.clear()
         self.messages.clear()
         self.row_matches.clear()
@@ -3138,24 +3556,30 @@ class MainWindow(tk.Tk):
             try:
                 found = [0]
                 def push_item(item):
+                    if search_stop_event.is_set():
+                        return
                     found[0] += 1
                     names = [str(mt.get("name", "")) for mt in matching_mail_types(item, self.profile)]
-                    self.ui_queue.put(("search_item", (item, names)))
+                    self.ui_queue.put(("search_item", (generation, item, names)))
                 self.imap.search_progressive(
-                    self.folder_var.get().strip() or "INBOX",
-                    self.subject_var.get(), self.sender_var.get(), self.stop_event,
+                    folder, subject, sender, search_stop_event,
                     push_item,
-                    lambda i, t: self.ui_queue.put(("progress", (i, t))),
+                    lambda i, t: self.ui_queue.put(("progress", (generation, i, t))),
                     include_body=needs_body,
+                    order=search_order,
+                    since_date=search_from,
+                    until_date=search_to,
+                    uid_filter=search_uid,
                 )
-                msg = "Ricerca interrotta" if self.stop_event.is_set() else f"Ricerca completata: {found[0]} mail"
-                self.ui_queue.put(("done", msg))
+                msg = "Ricerca interrotta" if search_stop_event.is_set() else f"Ricerca completata: {found[0]} mail"
+                self.ui_queue.put(("search_done", (generation, msg)))
             except Exception as e:
-                self.ui_queue.put(("error", e))
+                self.ui_queue.put(("search_error", (generation, e)))
         threading.Thread(target=worker, daemon=True).start()
 
     def stop_search(self):
         self.stop_event.set()
+        self.status_var.set("Interruzione ricerca…")
 
     def on_tree_select(self, _event=None):
         sel = self.tree.selection()
@@ -3426,6 +3850,7 @@ class MainWindow(tk.Tk):
         mt = {
             "name": slugify(name, "tipo_mail"),
             "description": "Creato dalla GUI",
+            "enabled": True,
             "match_rules": [
                 {
                     "name": "match_oggetto",
@@ -3441,6 +3866,159 @@ class MainWindow(tk.Tk):
         self.mail_type_var.set(mt["name"])
         self.edit_mail_type_criteria()
         return True
+
+    def manage_mail_type_priority(self):
+        """Gestisce ordine e anagrafica dei Tipi mail in una tabella dedicata."""
+        win = tk.Toplevel(self)
+        win.title("Priorità Tipi mail")
+        win.geometry("650x430")
+        win.minsize(540, 330)
+        frm = ttk.Frame(win, padding=12); frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="I Tipi mail vengono verificati dall'alto verso il basso. Il primo che corrisponde viene utilizzato.", wraplength=600).pack(fill="x", pady=(0, 8))
+        body = ttk.Frame(frm); body.pack(fill="both", expand=True)
+        tree = ttk.Treeview(body, columns=("priority","name","state"), show="headings", selectmode="browse")
+        tree.heading("priority", text="Priorità"); tree.heading("name", text="Tipo mail"); tree.heading("state", text="Stato")
+        tree.column("priority", width=75, stretch=False, anchor="center")
+        tree.column("name", width=350, stretch=True, anchor="w")
+        tree.column("state", width=110, stretch=False, anchor="center")
+        tree.tag_configure("disabled", foreground="#888888")
+        tree.pack(side="left", fill="both", expand=True)
+        sy=ttk.Scrollbar(body, orient="vertical", command=tree.yview); sy.pack(side="left", fill="y")
+        tree.configure(yscrollcommand=sy.set)
+        buttons=ttk.Frame(body); buttons.pack(side="right", fill="y", padx=(10,0))
+
+        def selected():
+            sel=tree.selection()
+            return int(sel[0]) if sel else None
+
+        def refresh(index=None):
+            tree.delete(*tree.get_children())
+            items=self.profile.get("mail_types", []) or []
+            for i, mt in enumerate(items):
+                enabled = bool(mt.get("enabled", True))
+                tree.insert(
+                    "", "end", iid=str(i),
+                    values=(i+1, str(mt.get("name","")), "Abilitato" if enabled else "Disabilitato"),
+                    tags=() if enabled else ("disabled",),
+                )
+            if items:
+                index=0 if index is None else max(0,min(index,len(items)-1))
+                tree.selection_set(str(index)); tree.focus(str(index)); tree.see(str(index))
+
+        def move(delta):
+            i=selected(); items=self.profile.get("mail_types", []) or []
+            if i is None: return
+            j=i+delta
+            if j<0 or j>=len(items): return
+            items[i],items[j]=items[j],items[i]
+            self._save_profile_immediately("Priorità Tipi mail aggiornata e salvata")
+            self._refresh_mail_types(); refresh(j)
+
+        def add():
+            n=len(self.profile.get("mail_types", []) or [])
+            self.create_mail_type()
+            refresh(len(self.profile.get("mail_types", []) or [])-1 if len(self.profile.get("mail_types", []) or [])>n else selected())
+
+        def rename():
+            i=selected(); items=self.profile.get("mail_types", []) or []
+            if i is None or i>=len(items): return
+            self.mail_type_var.set(str(items[i].get("name","")))
+            self.rename_current_mail_type(); refresh(i)
+
+        def copy_type():
+            i=selected(); items=self.profile.get("mail_types", []) or []
+            if i is None or i>=len(items): return
+            original=items[i]
+            base_name=str(original.get("name","tipo_mail") or "tipo_mail")
+            proposed=f"{base_name}_copia"
+            existing={str(x.get("name","")) for x in items if isinstance(x,dict)}
+            candidate=proposed
+            n=2
+            while candidate in existing:
+                candidate=f"{proposed}_{n}"
+                n+=1
+            value=simpledialog.askstring(
+                "Copia tipo mail",
+                "Nome del nuovo tipo mail:",
+                initialvalue=candidate,
+                parent=win,
+            )
+            if not value:
+                return
+            new_name=slugify(value, candidate)
+            if new_name in existing:
+                messagebox.showerror(
+                    "Copia tipo mail",
+                    f"Esiste già un tipo mail chiamato '{new_name}'.",
+                    parent=win,
+                )
+                return
+            cloned=copy.deepcopy(original)
+            cloned["name"]=new_name
+            items.insert(i+1, cloned)
+            self._save_profile_immediately(f"Tipo mail copiato: {base_name} → {new_name}")
+            self._refresh_mail_types()
+            self.mail_type_var.set(new_name)
+            refresh(i+1)
+
+        def toggle_enabled():
+            i=selected(); items=self.profile.get("mail_types", []) or []
+            if i is None or i>=len(items): return
+            mt=items[i]
+            enabled=not bool(mt.get("enabled", True))
+            mt["enabled"]=enabled
+            name=str(mt.get("name",""))
+            self._save_profile_immediately(f"Tipo mail {'abilitato' if enabled else 'disabilitato'}: {name}")
+            self._refresh_mail_types(); refresh(i)
+
+        def delete():
+            i=selected(); items=self.profile.get("mail_types", []) or []
+            if i is None or i>=len(items): return
+            self.mail_type_var.set(str(items[i].get("name","")))
+            before=len(items); self.delete_current_mail_type()
+            after=len(self.profile.get("mail_types", []) or [])
+            refresh(min(i,max(0,after-1)) if after<before else i)
+
+        ttk.Button(buttons,text="↑ Prima",command=lambda:move(-1),width=14).pack(fill="x",pady=2)
+        ttk.Button(buttons,text="↓ Dopo",command=lambda:move(1),width=14).pack(fill="x",pady=2)
+        ttk.Separator(buttons,orient="horizontal").pack(fill="x",pady=8)
+        ttk.Button(buttons,text="Nuovo",command=add,width=14).pack(fill="x",pady=2)
+        ttk.Button(buttons,text="Rinomina",command=rename,width=14).pack(fill="x",pady=2)
+        ttk.Button(buttons,text="Copia",command=copy_type,width=14).pack(fill="x",pady=2)
+        ttk.Button(buttons,text="Abilita / Disabilita",command=toggle_enabled,width=18).pack(fill="x",pady=(8,2))
+        ttk.Button(buttons,text="Elimina",command=delete,width=14).pack(fill="x",pady=2)
+        ttk.Button(buttons,text="Chiudi",command=win.destroy,width=14).pack(side="bottom",fill="x",pady=2)
+        tree.bind("<Double-1>",lambda _e:rename())
+        refresh()
+        win.transient(self); win.grab_set(); center_dialog_later(win,self)
+
+    def move_current_mail_type(self, direction: int):
+        """Sposta il Tipo mail attivo nell'ordine di priorità del profilo."""
+        mt = self._active_mail_type()
+        if not mt:
+            messagebox.showwarning("Tipo mail", "Seleziona prima un tipo mail.", parent=self)
+            return
+        items = self.profile.setdefault("mail_types", [])
+        try:
+            index = next(i for i, item in enumerate(items) if item is mt)
+        except StopIteration:
+            name = str(mt.get("name", ""))
+            try:
+                index = next(i for i, item in enumerate(items) if str(item.get("name", "")) == name)
+            except StopIteration:
+                return
+        new_index = index + (-1 if direction < 0 else 1)
+        if new_index < 0 or new_index >= len(items):
+            self.status_var.set("Il Tipo mail è già al limite dell'ordine.")
+            return
+        items[index], items[new_index] = items[new_index], items[index]
+        current_name = str(mt.get("name", ""))
+        self._save_profile_immediately(
+            f"Priorità Tipi mail aggiornata: {current_name} in posizione {new_index + 1}"
+        )
+        self._refresh_mail_types()
+        self.mail_type_var.set(current_name)
+        self._update_extraction_preview()
 
     def rename_current_mail_type(self):
         mt = self._active_mail_type()
@@ -3495,6 +4073,7 @@ class MainWindow(tk.Tk):
         self.status_var.set(f"Tipo mail eliminato: {name}")
 
     def _on_match_rules_changed(self):
+        self._save_profile_immediately("Regole di selezione mail aggiornate e salvate")
         # Le spunte nelle colonne dei tipi mail dipendono dai match: quando
         # l'utente modifica una regola, ricalcoliamo subito tutte le mail già
         # caricate dalla ricerca senza dover interrogare nuovamente IMAP.
@@ -3517,14 +4096,17 @@ class MainWindow(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.title(f"Regole di estrazione — {mt.get('name', '')}")
-        win.geometry("1020x470")
+        win.geometry("1220x500")
+        win.transient(self)
+        center_dialog_later(win, self)
         frm = ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
-        cols = ("name", "field", "type", "reconcile", "policy", "source", "strategy", "transform", "trigger")
+        cols = ("name", "field", "type", "reconcile", "policy", "source", "strategy", "transform", "valid_from", "valid_to", "trigger")
         tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="extended")
         for c, lab, w in [
             ("name","Regola",155),("field","Campo",130),("type","Tipo Excel",80),
             ("reconcile","Riconciliazione",100),("policy","Se già presente",110),
             ("source","Origine",70),("strategy","Strategia",95),("transform","Conversione",105),
+            ("valid_from","Valida da",90),("valid_to","Valida fino a",90),
             ("trigger","Trigger / pattern",240)
         ]:
             tree.heading(c, text=lab); tree.column(c, width=w, stretch=True)
@@ -3540,7 +4122,8 @@ class MainWindow(tk.Tk):
                 tree.insert("", "end", iid=str(i), values=(
                     rule.get("name",""), rule.get("field",""), typ, is_key,
                     UPDATE_POLICY_LABELS.get(rule.get("existing_value_policy", "replace"), "Sostituisci"),
-                    rule.get("source","body"), rule.get("strategy",""), rule.get("transform",""), detail
+                    rule.get("source","body"), rule.get("strategy",""), rule.get("transform",""),
+                    rule.get("valid_from",""), rule.get("valid_to",""), detail
                 ))
         def edit_rule():
             sel = tree.selection()
@@ -3769,12 +4352,12 @@ class MainWindow(tk.Tk):
         win.title("Campi del profilo e tipi Excel")
         win.geometry("1320x520")
         frm = ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
-        cols = ("order", "name", "type", "format", "mail_counter", "formula", "computed", "key")
+        cols = ("order", "name", "type", "format", "decimals", "mail_counter", "mail_uids", "formula", "computed", "key")
         tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse")
         for c, lab, w in [
             ("order", "Ordine Excel", 85), ("name", "Campo", 220), ("type", "Tipo cella Excel", 115),
-            ("format", "Formato", 90), ("mail_counter", "Conta Tipo mail", 170),
-            ("formula", "Formula finale", 105), ("computed", "Calcolo automatico", 260),
+            ("format", "Formato", 90), ("decimals", "Decimali", 70), ("mail_counter", "Conta Tipo mail", 170),
+            ("mail_uids", "UID email", 90), ("formula", "Formula finale", 105), ("computed", "Calcolo automatico", 260),
             ("key", "Riconciliazione", 110)
         ]:
             tree.heading(c, text=lab); tree.column(c, width=w, stretch=True)
@@ -3787,7 +4370,9 @@ class MainWindow(tk.Tk):
                     continue
                 typ = FIELD_TYPE_LABELS[normalize_field_type(field.get("type"))]
                 fmt = "Valuta €" if field.get("format") == "currency_eur" else ""
+                decimals = str(field.get("decimals", 2)) if normalize_field_type(field.get("type")) == "number" else ""
                 mail_counter = str(field.get("mail_type_counter", "") or "")
+                mail_uids = "Automatico" if field.get("auto_mail_uids") else ""
                 formula = FINAL_FORMULA_LABELS.get(str(field.get("final_formula", "") or "").lower(), "")
                 computed = ""
                 for comp in self.profile.get("computed_fields", []) or []:
@@ -3804,7 +4389,7 @@ class MainWindow(tk.Tk):
                     computed = f"Riepilogo: {'SOMMA' if kind == 'sum' else 'CONTA'} di {source}"
                 key = "Sì" if field.get("name") in self.profile.get("reconcile_keys", []) else ""
                 tree.insert("", "end", iid=str(i), values=(
-                    i + 1, field.get("name", ""), typ, fmt, mail_counter, formula, computed, key
+                    i + 1, field.get("name", ""), typ, fmt, decimals, mail_counter, mail_uids, formula, computed, key
                 ))
 
         def edit_field():
@@ -3861,6 +4446,7 @@ class MainWindow(tk.Tk):
                     parent=win,
                 )
                 refresh(); self._update_extraction_preview()
+                self._save_profile_immediately("Campi uniti e profilo salvato")
                 return
 
             self.profile["fields"][i] = new
@@ -3898,6 +4484,7 @@ class MainWindow(tk.Tk):
             if not dlg.key_var.get() and new_name in keys:
                 keys.remove(new_name)
             refresh(); self._update_extraction_preview()
+            self._save_profile_immediately("Campo modificato e profilo salvato")
 
         def add_field():
             dlg = FieldEditorDialog(win, self.profile)
@@ -3910,6 +4497,7 @@ class MainWindow(tk.Tk):
             if dlg.key_var.get():
                 self.profile.setdefault("reconcile_keys", []).append(dlg.result["name"])
             refresh()
+            self._save_profile_immediately("Nuovo campo aggiunto e profilo salvato")
 
         def delete_field():
             sel = tree.selection()
@@ -3964,6 +4552,7 @@ class MainWindow(tk.Tk):
                 del self.profile["fields"][i]
                 self.profile["reconcile_keys"] = [x for x in self.profile.get("reconcile_keys", []) if x != name]
                 refresh()
+                self._save_profile_immediately("Campo eliminato e profilo salvato")
 
         def move_field(delta: int):
             sel = tree.selection()
@@ -3979,7 +4568,7 @@ class MainWindow(tk.Tk):
             tree.selection_set(str(j))
             tree.focus(str(j))
             tree.see(str(j))
-            self.status_var.set("Ordine colonne Excel aggiornato")
+            self._save_profile_immediately("Ordine colonne Excel aggiornato e salvato")
 
         def show_field_generation_rules():
             sel = tree.selection()
@@ -3999,7 +4588,7 @@ class MainWindow(tk.Tk):
 
         def computed_fields_changed():
             refresh()
-            self.status_var.set("Campi calcolati aggiornati")
+            self._save_profile_immediately("Campi calcolati aggiornati e salvati")
 
         btns = ttk.Frame(frm); btns.pack(fill="x", pady=(8,0))
         ttk.Button(btns, text="Nuovo campo", command=add_field).pack(side="left")
@@ -4372,7 +4961,7 @@ class MainWindow(tk.Tk):
         return f"{base}::imap={self.config_mgr.active_imap_profile_id or 'none'}"
 
     def _active_extraction_state(self) -> dict:
-        """Stato operativo della coppia email + profilo, salvato nelle Preferenze email."""
+        """Stato operativo della coppia email + profilo, salvato nel relativo JSON in states/."""
         state = self.config_mgr.extraction_state(self.profile_path.name)
         # Migrazione una tantum dalle vecchie versioni, nelle quali lo stato era
         # contenuto nel JSON del profilo di estrazione.
@@ -4405,45 +4994,20 @@ class MainWindow(tk.Tk):
         self.config_mgr.save()
 
     def _remember_last_excel_path(self, path: str | Path) -> None:
-        """Memorizza per profilo l'ultimo Excel scritto con successo."""
-        mapping = self.config_mgr.data.setdefault("last_excel_by_profile", {})
-        if not isinstance(mapping, dict):
-            mapping = {}
-            self.config_mgr.data["last_excel_by_profile"] = mapping
-        mapping[self._profile_settings_key()] = str(Path(path).resolve())
+        """Salva l'ultimo Excel nello stato persistente della coppia email+profilo."""
+        state = self._active_extraction_state()
+        state["last_excel_path"] = str(Path(path).resolve())
         try:
             self.config_mgr.save()
         except Exception:
-            # Il file Excel è già stato scritto: un eventuale problema nel
-            # salvataggio della preferenza non deve invalidare l'estrazione.
             pass
 
     def _last_excel_path_for_profile(self) -> Path | None:
-        mapping = self.config_mgr.data.get("last_excel_by_profile", {}) or {}
-        if isinstance(mapping, dict):
-            value = str(mapping.get(self._profile_settings_key(), "") or "").strip()
-            if value:
-                path = Path(value)
-                if path.exists() and path.is_file():
-                    return path
-        # Compatibilità con estrazioni effettuate prima della v1.16: il log
-        # registra sempre il percorso Excel. Usiamo l'ultima occorrenza valida.
-        log_path = self._extraction_log_path()
-        if log_path.exists():
-            try:
-                last_from_log = ""
-                for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if line.startswith("File Excel:"):
-                        candidate = line.split(":", 1)[1].strip()
-                        if candidate:
-                            last_from_log = candidate
-                if last_from_log:
-                    legacy_path = Path(last_from_log)
-                    if legacy_path.exists() and legacy_path.is_file():
-                        return legacy_path
-            except Exception:
-                pass
-        # Fallback naturale per il file generale del profilo.
+        value = str(self._active_extraction_state().get("last_excel_path", "") or "").strip()
+        if value:
+            path = Path(value)
+            if path.exists() and path.is_file():
+                return path
         general = self._general_excel_path()
         if general.exists() and general.is_file():
             return general
@@ -4709,10 +5273,17 @@ class MainWindow(tk.Tk):
     def _extraction_log_path(self) -> Path:
         config = getattr(self, "config_mgr", None)
         email_name = getattr(config, "active_imap_profile_name", "") if config is not None else ""
-        if not email_name:
-            return self.profile_path.with_name(self.profile_path.stem + "_estrazione.log")
-        email = safe_filename_component(email_name, "email")
-        return self.profile_path.with_name(self.profile_path.stem + f"_{email}_estrazione.log")
+        logs_dir = config.ensure_logs_dir() if config is not None else self.profile_path.parent
+        email = safe_filename_component(email_name, "email") if email_name else "email"
+        return Path(logs_dir) / (self.profile_path.stem + f"_{email}_estrazione.log")
+
+    def _pipeline_log(self, message: str) -> None:
+        """Log immediato e resiliente delle operazioni della pipeline."""
+        try:
+            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            append_extraction_log(self._extraction_log_path(), f"[{stamp}] {message}")
+        except Exception:
+            pass
 
     def _fetch_and_extract(self, uids: list[int], folder: str) -> tuple[list[dict], int]:
         # Determiniamo prima l'ordine cronologico usando solo gli header.
@@ -4870,6 +5441,11 @@ class MainWindow(tk.Tk):
             operations_path = self._operations_cache_path()
             log_path = self._extraction_log_path()
             stats_total = {"mails": 0, "matched_mails": 0, "type_matches": 0, "field_updates": 0}
+            self._pipeline_log(
+                f"PIPELINE AVVIATA | profilo={pname} | email={self.config_mgr.active_imap_profile_name or ''} "
+                f"| cartella={folder} | ultimo_uid={last_uid} | lettura={read_path} | "
+                f"estrazione={operations_path} | excel={general_path}"
+            )
             uidv = old_uidv
             scan_max_uid = last_uid
             effective_last = last_uid
@@ -4880,6 +5456,10 @@ class MainWindow(tk.Tk):
                 # -----------------------------------------------------------------
                 operations_data = read_json(operations_path)
                 if operations_data and not self._pipeline_cache_matches(operations_data, folder, last_uid):
+                    self._pipeline_log(
+                        f"CACHE PIPELINE NON VALIDA: configurazione/stato modificati; "
+                        f"elimino {operations_path} e {read_path}"
+                    )
                     self._restore_original_if_pipeline_stale(general_path)
                     safe_unlink(operations_path)
                     safe_unlink(read_path)
@@ -4892,6 +5472,9 @@ class MainWindow(tk.Tk):
                     self.ui_queue.put(("extraction_phase_progress", ("read", 1, 1, pname, "cache già completata")))
                     done_count = len(operations_data.get("events", []) or [])
                     self.ui_queue.put(("extraction_phase_progress", ("extract", max(done_count, 1), max(done_count, 1), pname, "")))
+                    self._pipeline_log(
+                        f"RIPRESA DA JOURNAL COMPLETO: {operations_path}; Lettura ed Estrazione non vengono ripetute."
+                    )
                     self.ui_queue.put(("done", f"Profilo {pname} — estrazione già completata: riprendo dal Consolidamento."))
                 else:
                     # -------------------------------------------------------------
@@ -4899,6 +5482,7 @@ class MainWindow(tk.Tk):
                     # -------------------------------------------------------------
                     read_data = read_json(read_path)
                     if read_data and not self._pipeline_cache_matches(read_data, folder, last_uid):
+                        self._pipeline_log(f"LETTURA: checkpoint non valido; elimino {read_path}.")
                         safe_unlink(read_path)
                         read_data = None
 
@@ -4937,6 +5521,21 @@ class MainWindow(tk.Tk):
                             "extraction_phase_progress",
                             ("read", max(total_scanned, 1), max(total_scanned, 1), pname, f"candidate: {len(candidate_uids)} — cache"),
                         ))
+                        self._pipeline_log(
+                            f"LETTURA RIUSO CACHE | file={read_path} | header={total_scanned} | candidate={len(candidate_uids)}"
+                        )
+                        for _h in candidate_headers:
+                            _header_mail = MailMessage(
+                                uid=_h.uid, sender=_h.sender, subject=_h.subject, date=_h.date,
+                                message_id=_h.message_id, recipient=getattr(_h, "recipient", "") or "",
+                                body="", raw_date=getattr(_h, "raw_date", "") or "",
+                            )
+                            _candidate_types = header_prefilter_matching_mail_types(_header_mail, self.profile)
+                            self._pipeline_log(
+                                f"LETTURA CANDIDATA (cache) | UID={_h.uid} | data={getattr(_h, 'date', '')} "
+                                f"| mittente={getattr(_h, 'sender', '')} | oggetto={getattr(_h, 'subject', '')} "
+                                f"| candidata_per={','.join(_candidate_types) if _candidate_types else 'prefiltro profilo'}"
+                            )
                         self.ui_queue.put((
                             "done",
                             f"Profilo {pname} — Lettura già completata: uso {len(candidate_uids)} candidate salvate su disco.",
@@ -4957,6 +5556,10 @@ class MainWindow(tk.Tk):
                                         candidate_by_uid[int(row.get("uid", 0) or 0)] = row
                                     except Exception:
                                         pass
+                            self._pipeline_log(
+                                f"LETTURA RIPRESA | file={read_path} | "
+                                f"letti={len(processed_read_uids)}/{len(unique_uids)} | candidate={len(candidate_by_uid)}"
+                            )
                             self.ui_queue.put((
                                 "done",
                                 f"Profilo {pname} — riprendo la Lettura dal checkpoint: "
@@ -5055,7 +5658,21 @@ class MainWindow(tk.Tk):
                                 header = header_map.get(uid)
                                 if header is not None:
                                     if _reading_header_is_candidate(header):
+                                        _new_candidate = int(uid) not in candidate_by_uid
                                         candidate_by_uid[int(uid)] = header_to_dict(header)
+                                        if _new_candidate:
+                                            _header_mail = MailMessage(
+                                                uid=header.uid, sender=header.sender, subject=header.subject,
+                                                date=header.date, message_id=header.message_id,
+                                                recipient=getattr(header, "recipient", "") or "",
+                                                body="", raw_date=getattr(header, "raw_date", "") or "",
+                                            )
+                                            _candidate_types = header_prefilter_matching_mail_types(_header_mail, self.profile)
+                                            self._pipeline_log(
+                                                f"LETTURA CANDIDATA | UID={uid} | data={getattr(header, 'date', '')} "
+                                                f"| mittente={getattr(header, 'sender', '')} | oggetto={getattr(header, 'subject', '')} "
+                                                f"| candidata_per={','.join(_candidate_types) if _candidate_types else 'prefiltro profilo'}"
+                                            )
                                     processed_read_uids.add(int(uid))
                                 elif not self.extraction_stop_event.is_set():
                                     # Se il server ha completato il blocco ma un UID non
@@ -5077,6 +5694,10 @@ class MainWindow(tk.Tk):
                             })
                             # Checkpoint progressivo su disco ad ogni blocco.
                             atomic_write_json(read_path, read_data)
+                            self._pipeline_log(
+                                f"LETTURA CHECKPOINT | file={read_path} | "
+                                f"letti={len(processed_read_uids)}/{len(unique_uids)} | candidate={len(candidate_by_uid)}"
+                            )
                             self.ui_queue.put((
                                 "extraction_phase_progress",
                                 ("read", len(processed_read_uids), read_total, pname, f"candidate: {len(candidate_by_uid)}"),
@@ -5108,6 +5729,10 @@ class MainWindow(tk.Tk):
                             "candidates": [header_to_dict(h) for h in candidate_headers],
                         })
                         atomic_write_json(read_path, read_data)
+                        self._pipeline_log(
+                            f"FINE LETTURA | file={read_path} | header={len(unique_uids)} | "
+                            f"candidate={len(candidate_headers)} | sequenza ordinata salvata"
+                        )
                         self.ui_queue.put((
                             "extraction_phase_progress",
                             ("read", read_total, read_total, pname, f"candidate: {len(candidate_headers)}"),
@@ -5138,6 +5763,7 @@ class MainWindow(tk.Tk):
                             "events": [],
                         }
                         atomic_write_json(operations_path, operations_data)
+                        self._pipeline_log(f"ESTRAZIONE: journal creato {operations_path}")
 
                     processed = {int(x) for x in operations_data.get("processed_uids", []) or []}
                     remaining_uids = [uid for uid in candidate_uids if uid not in processed]
@@ -5170,6 +5796,19 @@ class MainWindow(tk.Tk):
                         event = extract_mail_detailed(mail, self.profile)
                         serialized = event_to_dict(event, self.profile)
 
+                        _types_for_log = [str(t.get("mail_type", "")) for t in event.get("types", [])]
+                        self._pipeline_log(
+                            f"ESTRAZIONE MAIL | UID={uid} | data={getattr(mail, 'date', '')} "
+                            f"| mittente={getattr(mail, 'sender', '')} | oggetto={getattr(mail, 'subject', '')} "
+                            f"| tipi={','.join(_types_for_log) if _types_for_log else 'NON RICONOSCIUTA'}"
+                        )
+                        for _op in serialized.get("operations", []) or []:
+                            self._pipeline_log(
+                                "ESTRAZIONE DATO | UID=%s | %s" % (
+                                    uid, json.dumps(_op, ensure_ascii=False, default=str)
+                                )
+                            )
+
                         # Journal esplicito delle modifiche Excel. Ogni singola
                         # operazione viene persistita atomicamente; in caso di
                         # crash la mail non marcata come processata verrà
@@ -5186,6 +5825,10 @@ class MainWindow(tk.Tk):
                         operations_data["processed_uids"] = sorted(processed)
                         operations_data["updated_at"] = datetime.now().isoformat(timespec="seconds")
                         atomic_write_json(operations_path, operations_data)
+                        self._pipeline_log(
+                            f"ESTRAZIONE JOURNAL | file={operations_path} | UID={uid} | "
+                            f"completate={len(processed)}/{len(candidate_uids)}"
+                        )
 
                         type_names = [str(t.get("mail_type", "")) for t in event.get("types", [])]
                         label = ", ".join(type_names) if type_names else "mail candidata ma non riconosciuta dopo il controllo del body"
@@ -5203,6 +5846,10 @@ class MainWindow(tk.Tk):
                     atomic_write_json(operations_path, operations_data)
                     # A fine Estrazione la sequenza di Lettura non serve più.
                     safe_unlink(read_path)
+                    self._pipeline_log(
+                        f"FINE ESTRAZIONE | journal={operations_path} | mail={len(processed)} | "
+                        f"lettura eliminata={read_path}"
+                    )
                     self.ui_queue.put((
                         "extraction_phase_progress",
                         ("extract", extract_total, extract_total, pname, ""),
@@ -5220,9 +5867,14 @@ class MainWindow(tk.Tk):
                     general_path,
                     lambda p: write_excel(p, [], self.profile),
                 )
+                self._pipeline_log(
+                    f"CONSOLIDAMENTO PREPARAZIONE | definitivo={general_path} | originale={original_path}"
+                )
                 # Ad ogni ripresa il temporaneo viene sempre ricreato dall'originale.
                 safe_unlink(temporary_path)
+                self._pipeline_log(f"CONSOLIDAMENTO: eliminato eventuale temporaneo {temporary_path}")
                 shutil.copy2(original_path, temporary_path)
+                self._pipeline_log(f"CONSOLIDAMENTO: copia {original_path} -> {temporary_path}")
 
                 records = load_existing_records(original_path, self.profile)
                 log_lines = [
@@ -5250,6 +5902,9 @@ class MainWindow(tk.Tk):
                         ))
                         return
                     event = dict_to_event(event_data)
+                    self._pipeline_log(
+                        f"CONSOLIDAMENTO OPERAZIONE {idx}/{len(events_data)} | UID={event_data.get('uid', '')}"
+                    )
                     records, stats, log_text = apply_detailed_extractions(
                         records, [event], self.profile,
                         mode="consolidamento", excel_path=general_path,
@@ -5264,6 +5919,9 @@ class MainWindow(tk.Tk):
 
                 # Un solo salvataggio Excel al termine di tutte le operazioni.
                 write_excel(temporary_path, records, self.profile)
+                self._pipeline_log(
+                    f"CONSOLIDAMENTO: salvato Excel temporaneo {temporary_path} | record={len(records)}"
+                )
                 # La PivotTable viene ricalcolata una sola volta per sessione, al termine del Consolidamento.
                 pivot_ok, pivot_msg = refresh_native_excel_pivot(temporary_path, self.profile)
                 if not pivot_ok:
@@ -5271,6 +5929,7 @@ class MainWindow(tk.Tk):
 
                 # Commit del file: il temporaneo diventa definitivo solo ora.
                 temporary_path.replace(general_path)
+                self._pipeline_log(f"CONSOLIDAMENTO COMMIT | {temporary_path} -> {general_path}")
                 # Manteniamo ancora l'originale fino a quando checkpoint/stato e
                 # file di lavoro non sono stati committati: così un crash in
                 # questa finestra può rifare il Consolidamento senza duplicare dati.
@@ -5286,6 +5945,10 @@ class MainWindow(tk.Tk):
                 safe_unlink(read_path)
                 self._clear_extraction_checkpoint()
                 safe_unlink(original_path)
+                self._pipeline_log(
+                    f"FINE CONSOLIDAMENTO | definitivo={general_path} | eliminati journal={operations_path}, "
+                    f"lettura={read_path}, originale={original_path}"
+                )
 
                 append_extraction_log(log_path, "\n".join(log_lines + [
                     f"Tabella totali: {pivot_msg}",
@@ -5470,20 +6133,32 @@ class MainWindow(tk.Tk):
             foreground="#666666", wraplength=760,
         ).grid(row=4, column=0, sticky="w", pady=(0,6))
 
+        lvar = tk.StringVar(value=str(self.config_mgr.logs_dir))
+        ttk.Label(general, text="Cartella log").grid(row=5, column=0, sticky="w", pady=(10,0))
+        log_row = ttk.Frame(general)
+        log_row.grid(row=6, column=0, sticky="ew", pady=5)
+        log_row.columnconfigure(0, weight=1)
+        ttk.Entry(log_row, textvariable=lvar).grid(row=0, column=0, sticky="ew")
+        def browse_logs():
+            p = filedialog.askdirectory(parent=win, initialdir=lvar.get())
+            if p: lvar.set(p)
+        ttk.Button(log_row, text="Sfoglia…", command=browse_logs).grid(row=0, column=1, padx=(6, 0))
+
         evar = tk.StringVar(value=str(self.config_mgr.email_dir))
-        ttk.Label(general, text="Cartella email").grid(row=5, column=0, sticky="w", pady=(10,0))
+        ttk.Label(general, text="Cartella email").grid(row=7, column=0, sticky="w", pady=(10,0))
         email_row = ttk.Frame(general)
-        email_row.grid(row=6, column=0, sticky="ew", pady=5)
+        email_row.grid(row=8, column=0, sticky="ew", pady=5)
         email_row.columnconfigure(0, weight=1)
         ttk.Entry(email_row, textvariable=evar).grid(row=0, column=0, sticky="ew")
         def browse_email_dir():
             p = filedialog.askdirectory(parent=win, initialdir=evar.get())
             if p: evar.set(p)
         ttk.Button(email_row, text="Sfoglia…", command=browse_email_dir).grid(row=0, column=1, padx=(6, 0))
-        ttk.Label(general, text="In questa cartella viene conservata la configurazione cifrata delle email.", foreground="#666666").grid(row=7,column=0,sticky="w")
+        ttk.Label(general, text="In questa cartella viene conservata la configurazione cifrata delle email.", foreground="#666666").grid(row=9,column=0,sticky="w")
 
+        ttk.Label(general, text=f"Cartella stati (automatica): {self.config_mgr.states_dir}", foreground="#666666").grid(row=10, column=0, sticky="w", pady=(8,0))
         imap_pref = ttk.Frame(general)
-        imap_pref.grid(row=8, column=0, sticky="ew", pady=10)
+        imap_pref.grid(row=11, column=0, sticky="ew", pady=10)
         ttk.Label(imap_pref, text="Email attivo:").pack(side="left")
         ttk.Label(imap_pref, textvariable=self.imap_profile_var, font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(5, 12))
         ttk.Button(
@@ -5597,6 +6272,8 @@ class MainWindow(tk.Tk):
             self.config_mgr.data["profiles_dir"] = str(Path(pvar.get()))
             self.config_mgr.data["work_dir"] = str(Path(wvar.get()))
             Path(wvar.get()).mkdir(parents=True, exist_ok=True)
+            self.config_mgr.data["logs_dir"] = str(Path(lvar.get()))
+            Path(lvar.get()).mkdir(parents=True, exist_ok=True)
             self.config_mgr.set_email_dir(Path(evar.get()))
             self.config_mgr.data["regex_abbreviations"] = normalize_regex_abbreviations(abbreviations)
             self.config_mgr.ensure_profiles_dir()
@@ -5611,7 +6288,7 @@ class MainWindow(tk.Tk):
                 "Preferenze",
                 "Preferenze salvate. Le abbreviazioni Regex sono già attive. "
                 "La nuova directory profili sarà usata al prossimo cambio profilo/avvio. "
-                "La cartella degli Excel e la cartella email sono già attive.",
+                "Le cartelle Excel, log ed email sono già attive.",
                 parent=win,
             )
             win.destroy()
@@ -6090,10 +6767,12 @@ class MainWindow(tk.Tk):
             state["extraction_start_date"] = dt.date().isoformat()
         state = self._active_extraction_state()
         state.update({"uidvalidity": 0, "last_processed_uid": 0, "last_processed_at": ""})
-        self.config_mgr.save()
+        # La data appartiene allo stato della coppia email + profilo: la scriviamo
+        # immediatamente nel relativo JSON, senza aspettare un successivo save generale.
+        self.config_mgr.save_extraction_state(self.profile_path.name)
         self._clear_extraction_checkpoint()
-        self.status_var.set("Data inizio estrazione aggiornata; alla prossima esecuzione la scansione ripartirà dalla data indicata")
-
+        self._refresh_home_profile_buttons()
+        self.status_var.set("Data inizio estrazione salvata; alla prossima esecuzione la scansione ripartirà dalla data indicata")
 
     def rebuild_general_extraction(self):
         """Azzera lo stato della sola coppia email+profilo e ricostruisce l'Excel generale."""
@@ -6123,6 +6802,22 @@ class MainWindow(tk.Tk):
         state.update({"uidvalidity": 0, "last_processed_uid": 0, "last_processed_at": ""})
         self.config_mgr.save()
         self._clear_extraction_checkpoint()
+        # Una riesecuzione generale deve ripartire davvero dalla Lettura:
+        # non riutilizza né la lista candidate né il journal della sessione precedente.
+        read_path = self._reading_cache_path()
+        operations_path = self._operations_cache_path()
+        safe_unlink(read_path)
+        safe_unlink(operations_path)
+        try:
+            original_path, temporary_path = transactional_paths(general_path)
+            safe_unlink(original_path)
+            safe_unlink(temporary_path)
+        except Exception:
+            pass
+        self._pipeline_log(
+            f"RIESEGUI ESTRAZIONE GENERALE | cache azzerata | lettura={read_path} | "
+            f"estrazione={operations_path} | data_inizio={start_label}"
+        )
         self.status_var.set(f"Ricostruzione completa da {start_label}…")
         self.extract_incremental()
 

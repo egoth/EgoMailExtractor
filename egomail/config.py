@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -14,7 +15,8 @@ from .regex_utils import normalize_regex_abbreviations
 from .edition import CONFIG_APP_NAME
 
 APP_NAME = CONFIG_APP_NAME
-CREDENTIALS_FILENAME = "imap_credentials.enc"
+CREDENTIALS_FILENAME = "email_credentials.enc"
+LEGACY_CREDENTIALS_FILENAME = "imap_credentials.enc"
 LEGACY_KEYRING_SERVICE = "EgoMailExtractor.IMAP"
 
 DEFAULT_REGEX_ABBREVIATIONS = [
@@ -31,6 +33,7 @@ DEFAULT_REGEX_ABBREVIATIONS = [
     {"token": "--DATA_TESTO_GENERICA--", "replacement": r"(?:lun|mar|mer|gio|ven|sab|dom)?\s*\d{1,2}\s+[^\W\d_]+(?:\s+\d{4})?"},
     {"token": "--QUALSIASI--", "replacement": r".*?"},
     {"token": "--EURO--", "replacement": r"--NUMERO-- €"},
+    {"token": "--RIGA--", "replacement": r"[^\r\n]+"},
     {"token": "--STESSA_RIGA--", "replacement": r"[^\r\n]+"},
 ]
 
@@ -94,6 +97,7 @@ class ConfigManager:
         self._default_imap_profile_id = ""
         self._imap = ImapSettings()
         self._imap_password = ""
+        self._state_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self.load()
 
     @property
@@ -107,9 +111,21 @@ class ConfigManager:
     def default_profiles_dir(self) -> Path:
         return self.app_dir / "profiles"
 
+    def default_work_dir(self) -> Path:
+        return self.app_dir / "excel"
+
+    def default_email_dir(self) -> Path:
+        return self.app_dir / "email"
+
+    def default_logs_dir(self) -> Path:
+        return self.app_dir / "logs"
+
+    def default_states_dir(self) -> Path:
+        return self.app_dir / "states"
+
     @property
     def work_dir(self) -> Path:
-        return Path(self.data.get("work_dir", self.data.get("profiles_dir", self.default_profiles_dir())))
+        return Path(self.data.get("work_dir", self.default_work_dir()))
 
     @property
     def profiles_dir(self) -> Path:
@@ -117,7 +133,15 @@ class ConfigManager:
 
     @property
     def email_dir(self) -> Path:
-        return Path(self.data.get("email_dir", self.app_dir))
+        return Path(self.data.get("email_dir", self.default_email_dir()))
+
+    @property
+    def logs_dir(self) -> Path:
+        return Path(self.data.get("logs_dir", self.default_logs_dir()))
+
+    @property
+    def states_dir(self) -> Path:
+        return self.default_states_dir()
 
     def ensure_email_dir(self) -> Path:
         path = self.email_dir
@@ -127,8 +151,9 @@ class ConfigManager:
     def load(self) -> None:
         defaults = {
             "profiles_dir": str(self.default_profiles_dir()),
-            "work_dir": str(self.default_profiles_dir()),
-            "email_dir": str(self.app_dir),
+            "work_dir": str(self.default_work_dir()),
+            "email_dir": str(self.default_email_dir()),
+            "logs_dir": str(self.default_logs_dir()),
             "window": {"geometry": "1450x900"},
             "regex_abbreviations": [dict(x) for x in DEFAULT_REGEX_ABBREVIATIONS],
             "regex_defaults_version": 1,
@@ -144,13 +169,16 @@ class ConfigManager:
                     legacy = loaded.get("imap")
                     if isinstance(legacy, dict):
                         self._legacy_imap = dict(legacy)
-                    for key in ("profiles_dir", "work_dir", "email_dir", "window", "regex_abbreviations", "regex_defaults_version", "last_excel_by_profile", "profile_associations_by_imap", "extraction_state_by_imap"):
+                    for key in ("profiles_dir", "work_dir", "email_dir", "logs_dir", "window", "regex_abbreviations", "regex_defaults_version", "last_excel_by_profile", "profile_associations_by_imap", "extraction_state_by_imap"):
                         if key in loaded:
                             defaults[key] = loaded[key]
-                    # Prima della v1.35 gli Excel generali erano accanto ai profili:
-                    # se non esiste ancora la preferenza manteniamo quel comportamento.
+                    # Dalla 1.46 le cartelle hanno destinazioni separate per default.
                     if "work_dir" not in loaded:
-                        defaults["work_dir"] = defaults["profiles_dir"]
+                        defaults["work_dir"] = str(self.default_work_dir())
+                    if "email_dir" not in loaded:
+                        defaults["email_dir"] = str(self.default_email_dir())
+                    if "logs_dir" not in loaded:
+                        defaults["logs_dir"] = str(self.default_logs_dir())
             except Exception:
                 pass
         if self.path.exists() and int(defaults.get("regex_defaults_version", 0) or 0) < 1:
@@ -161,27 +189,116 @@ class ConfigManager:
         self.data = defaults
         self.ensure_profiles_dir()
         self.ensure_email_dir()
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.states_dir.mkdir(parents=True, exist_ok=True)
         # La posizione del file cifrato email è configurabile dalle Preferenze.
         self.credentials_path = self.email_dir / CREDENTIALS_FILENAME
+        self._migrate_legacy_credentials_file()
         self.credentials_store = EncryptedJsonStore(self.credentials_path)
+        self._migrate_legacy_settings_state_to_files()
 
     def save(self) -> None:
         self.app_dir.mkdir(parents=True, exist_ok=True)
+        self._flush_state_cache()
         clean = {
             "profiles_dir": self.data.get("profiles_dir", str(self.default_profiles_dir())),
-            "work_dir": self.data.get("work_dir", self.data.get("profiles_dir", str(self.default_profiles_dir()))),
-            "email_dir": self.data.get("email_dir", str(self.app_dir)),
+            "work_dir": self.data.get("work_dir", str(self.default_work_dir())),
+            "email_dir": self.data.get("email_dir", str(self.default_email_dir())),
+            "logs_dir": self.data.get("logs_dir", str(self.default_logs_dir())),
             "window": self.data.get("window", {"geometry": "1450x900"}),
-            "regex_abbreviations": normalize_regex_abbreviations(
-                self.data.get("regex_abbreviations", [])
-            ),
+            "regex_abbreviations": normalize_regex_abbreviations(self.data.get("regex_abbreviations", [])),
             "regex_defaults_version": int(self.data.get("regex_defaults_version", 1) or 1),
-            "last_excel_by_profile": dict(self.data.get("last_excel_by_profile", {}) or {}),
             "profile_associations_by_imap": dict(self.data.get("profile_associations_by_imap", {}) or {}),
-            "extraction_state_by_imap": dict(self.data.get("extraction_state_by_imap", {}) or {}),
         }
         self.data = clean
         self.path.write_text(json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def _safe_state_component(value: str, fallback: str = "item") -> str:
+        value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip()).strip("._")
+        return value or fallback
+
+    def _state_file(self, profile_filename: str, imap_profile_id: str | None = None) -> Path:
+        pid = str(imap_profile_id or self._active_imap_profile_id or "default")
+        profile = self._safe_state_component(Path(profile_filename).stem, "profilo")
+        return self.states_dir / f"{profile}__{self._safe_state_component(pid, 'email')}.json"
+
+    def _email_name_for_id(self, pid: str) -> str:
+        for item in self._imap_profiles:
+            if str(item.get("id", "")) == str(pid):
+                return str(item.get("name", "") or "")
+        return ""
+
+    def _load_state_file(self, profile_filename: str, imap_profile_id: str | None = None) -> dict[str, Any]:
+        pid = str(imap_profile_id or self._active_imap_profile_id or "default")
+        key = (pid, str(Path(profile_filename).name))
+        if key in self._state_cache:
+            return self._state_cache[key]
+        path = self._state_file(profile_filename, pid)
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict): data = raw
+            except Exception:
+                data = {}
+        data.setdefault("schema_version", 1)
+        data["profile_file"] = str(Path(profile_filename).name)
+        data["email_profile_id"] = pid
+        if self._email_name_for_id(pid): data["email_name"] = self._email_name_for_id(pid)
+        self._state_cache[key] = data
+        return data
+
+    def _write_state_file(self, profile_filename: str, pid: str, state: dict[str, Any]) -> None:
+        self.states_dir.mkdir(parents=True, exist_ok=True)
+        path = self._state_file(profile_filename, pid)
+        payload = dict(state or {})
+        payload["schema_version"] = 1
+        payload["profile_file"] = str(Path(profile_filename).name)
+        payload["email_profile_id"] = str(pid)
+        if self._email_name_for_id(str(pid)): payload["email_name"] = self._email_name_for_id(str(pid))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+    def _flush_state_cache(self) -> None:
+        for (pid, profile_file), state in list(self._state_cache.items()):
+            self._write_state_file(profile_file, pid, state)
+
+    def _migrate_legacy_credentials_file(self) -> None:
+        if self.credentials_path.exists():
+            return
+        candidates = [self.email_dir / LEGACY_CREDENTIALS_FILENAME, self.app_dir / LEGACY_CREDENTIALS_FILENAME]
+        for old in candidates:
+            if old.exists() and old.is_file():
+                self.credentials_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old, self.credentials_path)
+                break
+
+    def _migrate_legacy_settings_state_to_files(self) -> None:
+        legacy = self.data.get("extraction_state_by_imap", {}) or {}
+        if isinstance(legacy, dict):
+            for pid, mapping in legacy.items():
+                if not isinstance(mapping, dict): continue
+                for profile_file, state in mapping.items():
+                    if isinstance(state, dict) and not self._state_file(profile_file, str(pid)).exists():
+                        self._write_state_file(profile_file, str(pid), dict(state))
+        # Anche l'ultimo percorso Excel viene inglobato nello stato della coppia.
+        last_map = self.data.get("last_excel_by_profile", {}) or {}
+        if isinstance(last_map, dict):
+            for composite, value in last_map.items():
+                if not value: continue
+                m = re.search(r"::imap=([^:]+)$", str(composite))
+                pid = m.group(1) if m else "default"
+                # Trova il profilo dal path prima di ::imap.
+                base = str(composite).split("::imap=",1)[0]
+                profile_file = Path(base).name
+                st = self._load_state_file(profile_file, pid)
+                st.setdefault("last_excel_path", str(value))
+        self.data.pop("extraction_state_by_imap", None)
+        self.data.pop("last_excel_by_profile", None)
+        self._flush_state_cache()
 
     @staticmethod
     def _normalize_imap_profile(raw: dict[str, Any], index: int = 1) -> dict[str, Any]:
@@ -344,7 +461,7 @@ class ConfigManager:
     @property
     def work_dir(self) -> Path:
         """Cartella di lavoro che contiene gli Excel generali dei profili."""
-        value = self.data.get("work_dir") or self.data.get("profiles_dir") or self.default_profiles_dir()
+        value = self.data.get("work_dir") or self.default_work_dir()
         path = Path(value)
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -363,6 +480,7 @@ class ConfigManager:
             shutil.copy2(old_path, new_path)
         self.data["email_dir"] = str(new_dir)
         self.credentials_path = new_path
+        self._migrate_legacy_credentials_file()
         self.credentials_store = EncryptedJsonStore(self.credentials_path)
         self.save()
 
@@ -407,6 +525,23 @@ class ConfigManager:
         if changed:
             self.save()
 
+    def remove_associated_profile(self, profile_name: str) -> None:
+        """Rimuove un profilo di estrazione dalle associazioni di tutte le email."""
+        target = str(Path(profile_name).name)
+        mapping = self.data.get("profile_associations_by_imap", {}) or {}
+        if not isinstance(mapping, dict):
+            return
+        changed = False
+        for pid, values in list(mapping.items()):
+            if not isinstance(values, list):
+                continue
+            updated = [str(x) for x in values if str(x) != target]
+            if updated != values:
+                mapping[pid] = updated
+                changed = True
+        if changed:
+            self.save()
+
     @property
     def regex_abbreviations(self) -> list[dict[str, str]]:
         return normalize_regex_abbreviations(self.data.get("regex_abbreviations", []))
@@ -419,21 +554,8 @@ class ConfigManager:
     # Profili IMAP cifrati
     # ------------------------------------------------------------------
     def extraction_state(self, profile_filename: str, imap_profile_id: str | None = None) -> dict[str, Any]:
-        """Stato operativo separato per coppia email + profilo di estrazione."""
-        pid = str(imap_profile_id or self._active_imap_profile_id or "default")
-        profile_key = str(Path(profile_filename).name)
-        root = self.data.setdefault("extraction_state_by_imap", {})
-        if not isinstance(root, dict):
-            root = {}
-            self.data["extraction_state_by_imap"] = root
-        by_profile = root.setdefault(pid, {})
-        if not isinstance(by_profile, dict):
-            by_profile = {}
-            root[pid] = by_profile
-        state = by_profile.setdefault(profile_key, {})
-        if not isinstance(state, dict):
-            state = {}
-            by_profile[profile_key] = state
+        """Stato operativo persistente in un JSON separato per email + profilo."""
+        state = self._load_state_file(profile_filename, imap_profile_id)
         state.setdefault("folder", "INBOX")
         state.setdefault("uidvalidity", 0)
         state.setdefault("last_processed_uid", 0)
@@ -442,68 +564,64 @@ class ConfigManager:
         state.setdefault("first_processed_at", "")
         state.setdefault("extraction_start_date", "")
         state.setdefault("home_summary_values", [])
+        state.setdefault("home_summary_updated_at", "")
+        state.setdefault("last_excel_path", "")
         return state
 
+
+    def save_extraction_state(self, profile_filename: str, imap_profile_id: str | None = None) -> None:
+        """Scrive subito su disco lo stato della coppia email + profilo."""
+        pid = str(imap_profile_id or self._active_imap_profile_id or "default")
+        state = self.extraction_state(profile_filename, pid)
+        self._write_state_file(profile_filename, pid, state)
+
     def all_extraction_states_for_profile(self, profile_filename: str) -> dict[str, dict[str, Any]]:
-        profile_key = str(Path(profile_filename).name)
-        root = self.data.get("extraction_state_by_imap", {}) or {}
-        out = {}
-        if isinstance(root, dict):
-            for pid, mapping in root.items():
-                if isinstance(mapping, dict) and isinstance(mapping.get(profile_key), dict):
-                    out[str(pid)] = dict(mapping[profile_key])
+        out: dict[str, dict[str, Any]] = {}
+        pkey = str(Path(profile_filename).name)
+        # Cache + file su disco.
+        for (pid, pf), state in self._state_cache.items():
+            if pf == pkey: out[str(pid)] = dict(state)
+        self.states_dir.mkdir(parents=True, exist_ok=True)
+        for path in self.states_dir.glob("*.json"):
+            try:
+                raw=json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(raw, dict) and str(raw.get("profile_file", "")) == pkey:
+                pid=str(raw.get("email_profile_id", "") or "default")
+                out.setdefault(pid, raw)
         return out
 
     def set_all_extraction_states_for_profile(self, profile_filename: str, states: dict[str, Any]) -> None:
-        profile_key = str(Path(profile_filename).name)
-        root = self.data.setdefault("extraction_state_by_imap", {})
-        if not isinstance(root, dict):
-            root = {}; self.data["extraction_state_by_imap"] = root
-        # Rimuove gli stati esistenti di questo profilo, poi ripristina quelli ricevuti.
-        for pid, mapping in list(root.items()):
-            if isinstance(mapping, dict):
-                mapping.pop(profile_key, None)
+        self.remove_extraction_profile_state(profile_filename)
         for pid, state in (states or {}).items():
-            mapping = root.setdefault(str(pid), {})
-            if isinstance(mapping, dict) and isinstance(state, dict):
-                mapping[profile_key] = dict(state)
-        self.save()
+            if isinstance(state, dict):
+                key=(str(pid), str(Path(profile_filename).name))
+                self._state_cache[key]=dict(state)
+                self._write_state_file(profile_filename, str(pid), self._state_cache[key])
 
     def rename_extraction_profile_state(self, old_name: str, new_name: str) -> None:
-        old_key, new_key = str(Path(old_name).name), str(Path(new_name).name)
-        root = self.data.get("extraction_state_by_imap", {}) or {}
-        changed = False
-        if isinstance(root, dict):
-            for mapping in root.values():
-                if isinstance(mapping, dict) and old_key in mapping:
-                    mapping[new_key] = mapping.pop(old_key)
-                    changed = True
-        if changed:
-            self.save()
+        states=self.all_extraction_states_for_profile(old_name)
+        self.remove_extraction_profile_state(old_name)
+        self.set_all_extraction_states_for_profile(new_name, states)
 
     def remove_extraction_profile_state(self, profile_name: str) -> None:
-        key = str(Path(profile_name).name)
-        root = self.data.get("extraction_state_by_imap", {}) or {}
-        changed = False
-        if isinstance(root, dict):
-            for mapping in root.values():
-                if isinstance(mapping, dict) and key in mapping:
-                    mapping.pop(key, None); changed = True
-        if changed:
-            self.save()
+        key=str(Path(profile_name).name)
+        for cache_key in [k for k in self._state_cache if k[1] == key]:
+            self._state_cache.pop(cache_key, None)
+        for path in self.states_dir.glob("*.json"):
+            try:
+                raw=json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(raw, dict) and str(raw.get("profile_file", "")) == key:
+                try: path.unlink()
+                except Exception: pass
 
     def duplicate_extraction_profile_state(self, old_name: str, new_name: str) -> None:
         import copy
-        old_key, new_key = str(Path(old_name).name), str(Path(new_name).name)
-        root = self.data.setdefault("extraction_state_by_imap", {})
-        if not isinstance(root, dict):
-            return
-        changed = False
-        for mapping in root.values():
-            if isinstance(mapping, dict) and isinstance(mapping.get(old_key), dict):
-                mapping[new_key] = copy.deepcopy(mapping[old_key]); changed = True
-        if changed:
-            self.save()
+        states={pid: copy.deepcopy(st) for pid, st in self.all_extraction_states_for_profile(old_name).items()}
+        self.set_all_extraction_states_for_profile(new_name, states)
 
     def list_imap_profiles(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -674,9 +792,28 @@ class ConfigManager:
     def ensure_profiles_dir(self) -> None:
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
 
+    def ensure_logs_dir(self) -> Path:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        return self.logs_dir
+
+    def ensure_states_dir(self) -> Path:
+        self.states_dir.mkdir(parents=True, exist_ok=True)
+        return self.states_dir
+
     def install_builtin_profiles(self, builtin_dir: Path) -> None:
         self.ensure_profiles_dir()
-        for src in builtin_dir.glob("*.json"):
+        # Dalla 1.46 il solo profilo predefinito installato in un ambiente vuoto è Paypal.
+        # Gli altri JSON in builtin_profiles restano come fixture/esempi interni.
+        for src in builtin_dir.glob("paypal.json"):
             dst = self.profiles_dir / src.name
             if not dst.exists():
                 shutil.copy2(src, dst)
+        icon_source = builtin_dir.parent / "builtin_profile_icons"
+        if icon_source.exists():
+            icon_dir = self.profiles_dir / "icons"
+            icon_dir.mkdir(parents=True, exist_ok=True)
+            for src in icon_source.glob("*"):
+                if src.is_file():
+                    dst = icon_dir / src.name
+                    if not dst.exists():
+                        shutil.copy2(src, dst)

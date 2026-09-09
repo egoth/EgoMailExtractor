@@ -11,6 +11,7 @@ from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from typing import Callable, Iterable
+from datetime import timedelta
 
 from bs4 import BeautifulSoup
 
@@ -218,20 +219,28 @@ class ImapService:
         include_body: bool = False,
         order: str = "desc",
         since_date=None,
+        until_date=None,
+        uid_filter: int | None = None,
     ) -> None:
         """Ricerca progressiva con prefiltri eseguiti, quando possibile, dal server IMAP.
 
         ``order`` può essere ``desc`` (mail più recenti prima) oppure ``asc``.
-        ``since_date`` accetta un ``datetime.date`` e viene tradotto nel criterio
-        IMAP SINCE, così le caselle molto grandi non devono essere percorse per intero.
+        ``since_date`` e ``until_date`` accettano ``datetime.date``. L'estremo
+        finale è incluso e viene tradotto in IMAP BEFORE del giorno successivo.
+        ``uid_filter`` limita la ricerca a uno specifico UID IMAP della cartella.
         """
         conn = self._connect()
         try:
             self._select(conn, folder)
             criteria: list[str] = []
+            months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
             if since_date is not None:
-                months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
                 criteria.extend(["SINCE", f'{since_date.day:02d}-{months[since_date.month-1]}-{since_date.year:04d}'])
+            if until_date is not None:
+                before = until_date + timedelta(days=1)
+                criteria.extend(["BEFORE", f'{before.day:02d}-{months[before.month-1]}-{before.year:04d}'])
+            if uid_filter is not None:
+                criteria.extend(["UID", str(int(uid_filter))])
             # SUBJECT/FROM riducono drasticamente i candidati sui server che li indicizzano.
             # Il filtro viene comunque ricontrollato localmente sotto, quindi non cambia
             # il risultato funzionale del programma.
@@ -256,6 +265,10 @@ class ImapService:
             for i, uid in enumerate(uids, 1):
                 if stop_event.is_set():
                     break
+                # Anche dopo un eventuale fallback SEARCH ALL, manteniamo
+                # esatto il filtro UID richiesto dall'utente.
+                if uid_filter is not None and uid != int(uid_filter):
+                    continue
                 status, chunks = conn.uid(
                     "fetch", str(uid),
                     "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])"

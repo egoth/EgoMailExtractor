@@ -12,8 +12,8 @@ from typing import Any
 PROFILE_VERSION = 7
 
 
-FIELD_TYPES = ("text", "date", "number")
-MATCH_SOURCES = ("subject", "sender", "body")
+FIELD_TYPES = ("text", "date", "datetime", "number")
+MATCH_SOURCES = ("subject", "sender", "body", "date")
 MATCH_MODES = ("contains", "regex")
 UPDATE_POLICIES = ("replace", "keep", "sum")
 FINAL_FORMULAS = ("sum", "count")
@@ -21,9 +21,11 @@ EXTRACTION_SOURCES = ("body", "subject", "sender", "date", "message_id")
 
 
 def normalize_field_type(value: str | None) -> str:
-    """Converte i tipi delle versioni precedenti nei tre tipi Excel esposti."""
+    """Normalizza i tipi Excel esposti dalla GUI, inclusa Data-Ora."""
     value = (value or "text").strip().lower()
-    if value in {"date", "datetime"}:
+    if value in {"datetime", "date_time", "data_ora", "data-ora"}:
+        return "datetime"
+    if value == "date":
         return "date"
     if value in {"number", "int", "integer", "float", "money", "currency", "decimal"}:
         return "number"
@@ -72,12 +74,21 @@ def normalize_match_rules(mail_type: dict[str, Any]) -> list[dict[str, Any]]:
         if mode not in MATCH_MODES:
             mode = "contains"
         trigger = item.get("trigger", item.get("pattern", item.get("value", "")))
-        normalized.append({
+        normalized_rule = {
             "name": str(item.get("name") or f"match_{source}_{i}"),
             "source": source,
             "mode": mode,
             "trigger": str(trigger or ""),
-        })
+        }
+        # Le regole Data usano questi limiti come criterio di selezione.
+        # Li conserviamo anche per compatibilità con profili 1.46.7.
+        valid_from = str(item.get("valid_from", "") or "").strip()
+        valid_to = str(item.get("valid_to", "") or "").strip()
+        if valid_from:
+            normalized_rule["valid_from"] = valid_from
+        if valid_to:
+            normalized_rule["valid_to"] = valid_to
+        normalized.append(normalized_rule)
     mail_type["match_rules"] = normalized
     # Dalla v1.5 la fonte di verità è match_rules. Rimuoviamo criteria per
     # evitare che l'utente modifichi due strutture diverse per lo stesso match.
@@ -104,7 +115,7 @@ def _merge_field_metadata(target: dict[str, Any], source: dict[str, Any]) -> dic
         target["type"] = source_type
     else:
         target["type"] = target_type
-    for attr in ("format", "mail_type_counter", "final_formula", "summary_source_field"):
+    for attr in ("format", "decimals", "mail_type_counter", "final_formula", "summary_source_field", "auto_mail_uids"):
         if not target.get(attr) and source.get(attr):
             target[attr] = source[attr]
     return target
@@ -212,6 +223,13 @@ def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
             field["type"] = normalize_field_type(old_type)
             if old_type in {"money", "currency"} and not field.get("format"):
                 field["format"] = "currency_eur"
+            if field["type"] == "number":
+                try:
+                    field["decimals"] = max(0, min(10, int(field.get("decimals", 2))))
+                except (TypeError, ValueError):
+                    field["decimals"] = 2
+            else:
+                field.pop("decimals", None)
         else:
             continue
         formula = str(field.get("final_formula", "") or "").strip().lower()
@@ -249,6 +267,7 @@ def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
             field.pop("summary_source_field", None)
     for mail_type in profile.get("mail_types", []):
         if isinstance(mail_type, dict):
+            mail_type["enabled"] = bool(mail_type.get("enabled", True))
             normalize_match_rules(mail_type)
             for rule in mail_type.setdefault("rules", []):
                 if not isinstance(rule, dict):
@@ -285,7 +304,7 @@ def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
     }
     date_field_names_for_summary = {
         str(f.get("name", "")) for f in normalized_fields
-        if isinstance(f, dict) and f.get("name") and normalize_field_type(f.get("type")) == "date"
+        if isinstance(f, dict) and f.get("name") and normalize_field_type(f.get("type")) in {"date", "datetime"}
     }
     for item in profile.get("summary_formulas", []) or []:
         if not isinstance(item, dict):
@@ -327,6 +346,41 @@ def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
         summary_formulas.append(normalized)
     profile["summary_formulas"] = summary_formulas
 
+    # Fino a due formule finali Excel possono essere mostrate nella schermata
+    # iniziale. Salviamo i nomi dei campi (non gli alias) perché l'etichetta
+    # dipende dal tipo corrente della formula finale (Somma/Conta).
+    # Fino a sei valori possono essere mostrati nella home. I riferimenti
+    # sono tipizzati per distinguere campi, campi calcolati e formule nominate.
+    final_summary_names = {
+        str(f.get("name", "")) for f in normalized_fields
+        if isinstance(f, dict) and str(f.get("final_formula", "") or "").lower() in {"sum", "count"}
+    }
+    raw_computed_names = {
+        str(x.get("field", "") or "") for x in profile.get("computed_fields", []) or []
+        if isinstance(x, dict) and x.get("field")
+    }
+    summary_names = {
+        str(x.get("name", "") or "") for x in profile.get("summary_formulas", []) or []
+        if isinstance(x, dict) and x.get("name")
+    }
+    valid_home_refs = (
+        {name for name in final_summary_names}
+        | {f"computed:{name}" for name in raw_computed_names if name}
+        | {f"summary:{name}" for name in summary_names if name}
+    )
+    home_summary_fields: list[str] = []
+    for ref in profile.get("home_summary_fields", []) or []:
+        ref = str(ref or "").strip()
+        if not ref:
+            continue
+        if ref.startswith("field:") and ref.split(":", 1)[1] in final_summary_names:
+            ref = ref.split(":", 1)[1]
+        if ref in valid_home_refs and ref not in home_summary_fields:
+            home_summary_fields.append(ref)
+        if len(home_summary_fields) >= 6:
+            break
+    profile["home_summary_fields"] = home_summary_fields
+
     # Campi calcolati del profilo. Dalla v1.16 sono completamente gestibili
     # dalla GUI e possono scegliere se una regola esplicita della mail corrente
     # deve avere priorità sul ricalcolo automatico.
@@ -365,38 +419,6 @@ def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "folder": "INBOX", "uidvalidity": 0,
         "last_processed_uid": 0, "last_processed_at": ""
     })
-    # Fino a sei valori possono essere mostrati nella home. I riferimenti
-    # sono tipizzati per distinguere campi, campi calcolati e formule nominate.
-    final_summary_names = {
-        str(f.get("name", "")) for f in normalized_fields
-        if isinstance(f, dict) and str(f.get("final_formula", "") or "").lower() in {"sum", "count"}
-    }
-    raw_computed_names = {
-        str(x.get("field", "") or "") for x in profile.get("computed_fields", []) or []
-        if isinstance(x, dict) and x.get("field")
-    }
-    summary_names = {
-        str(x.get("name", "") or "") for x in profile.get("summary_formulas", []) or []
-        if isinstance(x, dict) and x.get("name")
-    }
-    valid_home_refs = (
-        {name for name in final_summary_names}
-        | {f"computed:{name}" for name in raw_computed_names if name}
-        | {f"summary:{name}" for name in summary_names if name}
-    )
-    home_summary_fields: list[str] = []
-    for ref in profile.get("home_summary_fields", []) or []:
-        ref = str(ref or "").strip()
-        if not ref:
-            continue
-        if ref.startswith("field:") and ref.split(":", 1)[1] in final_summary_names:
-            ref = ref.split(":", 1)[1]
-        if ref in valid_home_refs and ref not in home_summary_fields:
-            home_summary_fields.append(ref)
-        if len(home_summary_fields) >= 6:
-            break
-    profile["home_summary_fields"] = home_summary_fields
-
     return profile
 
 

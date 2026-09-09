@@ -96,6 +96,72 @@ def parse_it_date(value: str, email_year: int | None) -> str | None:
         return None
 
 
+def _convert_numeric_date(value: str, *, source: str, target: str) -> str | None:
+    """Converte date numeriche USA/EU conservando un output ISO per Excel.
+
+    source='us': MM/DD/YYYY; source='eu': DD/MM/YYYY.
+    target è usato solo per chiarezza semantica: il valore restituito resta
+    ISO YYYY-MM-DD, formato interno coerente con le altre conversioni Data.
+    """
+    text = str(value or "").strip()
+    m = re.search(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", text)
+    if not m:
+        return None
+    a, b, y = map(int, m.groups())
+    month, day = (a, b) if source == "us" else (b, a)
+    try:
+        return date(y, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _parse_numeric_datetime(value: str, *, source: str) -> datetime | None:
+    """Legge date/date-ora numeriche EU o USA, con secondi e millisecondi opzionali.
+
+    Sono accettati anche valori come ``13/07/2026, 16:42``.
+    ``source='eu'`` interpreta GG/MM/AAAA; ``source='us'`` MM/GG/AAAA.
+    """
+    text = str(value or "").strip()
+    m = re.search(
+        r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})"
+        r"(?:\s*,?\s+(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,6}))?)?)?",
+        text,
+    )
+    if not m:
+        return None
+    a, b, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    month, day = (a, b) if source == "us" else (b, a)
+    hour = int(m.group(4) or 0)
+    minute = int(m.group(5) or 0)
+    second = int(m.group(6) or 0)
+    fraction = (m.group(7) or "")[:6]
+    microsecond = int(fraction.ljust(6, "0")) if fraction else 0
+    try:
+        return datetime(year, month, day, hour, minute, second, microsecond)
+    except ValueError:
+        return None
+
+
+def _convert_target_date(value: str, *, source: str, include_time: bool) -> str | None:
+    parsed = _parse_numeric_datetime(value, source=source)
+    if parsed is None:
+        # La strategia email_date fornisce normalmente un header RFC 2822,
+        # es. "Mon, 13 Jul 2026 16:42:00 +0000". Le conversioni Data/Data-Ora
+        # devono quindi accettare anche questo formato senza richiedere Regex.
+        try:
+            parsed = parsedate_to_datetime(str(value or "").strip())
+        except Exception:
+            parsed = None
+    if parsed is None:
+        return None
+    if not include_time:
+        return parsed.date().isoformat()
+    # Formato interno non ambiguo; Excel lo scriverà come vera cella Data-Ora.
+    if parsed.microsecond:
+        return parsed.isoformat(sep=" ", timespec="milliseconds")
+    return parsed.isoformat(sep=" ", timespec="seconds")
+
+
 def transform(value: Any, kind: str | None, mail: MailMessage) -> Any:
     if value is None:
         return None
@@ -109,6 +175,18 @@ def transform(value: Any, kind: str | None, mail: MailMessage) -> Any:
         return parse_guest_count(str(value))
     if kind == "date_it_email_year":
         return parse_it_date(str(value), mail.year)
+    if kind == "date_us_to_eu":
+        return _convert_numeric_date(str(value), source="us", target="eu")
+    if kind == "date_eu_to_us":
+        return _convert_numeric_date(str(value), source="eu", target="us")
+    if kind == "date_eu":
+        return _convert_target_date(str(value), source="eu", include_time=False)
+    if kind == "datetime_eu":
+        return _convert_target_date(str(value), source="eu", include_time=True)
+    if kind == "date_us":
+        return _convert_target_date(str(value), source="us", include_time=False)
+    if kind == "datetime_us":
+        return _convert_target_date(str(value), source="us", include_time=True)
     if kind == "upper":
         return str(value).strip().upper()
     return str(value).strip()
@@ -131,13 +209,24 @@ def _source(mail: MailMessage, name: str) -> str:
 def match_selection_rule(mail: MailMessage, rule: dict[str, Any]) -> bool:
     """Valuta una singola regola di selezione del tipo mail.
 
-    Un trigger vuoto non partecipa al match. ``matches_mail_type`` considera
-    solo le regole compilate e richiede che siano TUTTE vere.
+    Oltre al trigger, rispetta l'eventuale intervallo valid_from/valid_to
+    applicato alla data della mail, con estremi inclusi.
     """
+    source_name = str(rule.get("source", "body") or "body")
+    valid, _reason = rule_valid_for_mail_date(mail, rule)
+    if not valid:
+        return False
+    # "Data" è un criterio autonomo: non usa Trigger/Regex ma soltanto i due
+    # limiti valid_from/valid_to. Basta un solo estremo compilato.
+    if source_name == "date":
+        return bool(
+            str(rule.get("valid_from", "") or "").strip()
+            or str(rule.get("valid_to", "") or "").strip()
+        )
     trigger = str(rule.get("trigger", "") or "").strip()
     if not trigger:
         return True
-    source = _source(mail, str(rule.get("source", "body")))
+    source = _source(mail, source_name)
     mode = str(rule.get("mode", "contains") or "contains").lower()
     if mode == "regex":
         try:
@@ -148,12 +237,26 @@ def match_selection_rule(mail: MailMessage, rule: dict[str, Any]) -> bool:
 
 
 def matches_mail_type(mail: MailMessage, mail_type: dict[str, Any]) -> bool:
+    if not bool(mail_type.get("enabled", True)):
+        return False
     # Nuovo formato v1.5: lista arbitraria di regole di match. Tutte le
     # regole compilate devono valere (AND). Un tipo senza trigger non seleziona
     # nessuna mail, così non può catturare accidentalmente l'intera casella.
     match_rules = mail_type.get("match_rules")
     if match_rules is not None:
-        active = [r for r in match_rules if isinstance(r, dict) and str(r.get("trigger", "") or "").strip()]
+        active = [
+            r for r in match_rules
+            if isinstance(r, dict) and (
+                str(r.get("trigger", "") or "").strip()
+                or (
+                    str(r.get("source", "") or "") == "date"
+                    and (
+                        str(r.get("valid_from", "") or "").strip()
+                        or str(r.get("valid_to", "") or "").strip()
+                    )
+                )
+            )
+        ]
         return bool(active) and all(match_selection_rule(mail, r) for r in active)
 
     # Compatibilità difensiva per profili non ancora normalizzati.
@@ -187,6 +290,8 @@ def header_prefilter_matches_profile(mail: MailMessage, profile: dict[str, Any])
     for mail_type in profile.get("mail_types", []) or []:
         if not isinstance(mail_type, dict):
             continue
+        if not bool(mail_type.get("enabled", True)):
+            continue
         rules = mail_type.get("match_rules")
         if rules is None:
             # Compatibilità con i profili storici: i criteri subject/sender sono
@@ -216,7 +321,19 @@ def header_prefilter_matches_profile(mail: MailMessage, profile: dict[str, Any])
                 return True
             continue
 
-        active = [r for r in rules if isinstance(r, dict) and str(r.get("trigger", "") or "").strip()]
+        active = [
+            r for r in rules
+            if isinstance(r, dict) and (
+                str(r.get("trigger", "") or "").strip()
+                or (
+                    str(r.get("source", "") or "") == "date"
+                    and (
+                        str(r.get("valid_from", "") or "").strip()
+                        or str(r.get("valid_to", "") or "").strip()
+                    )
+                )
+            )
+        ]
         if not active:
             continue
         header_rules = [r for r in active if str(r.get("source", "body") or "body") in header_sources]
@@ -224,8 +341,51 @@ def header_prefilter_matches_profile(mail: MailMessage, profile: dict[str, Any])
             return True
     return False
 
+def header_prefilter_matching_mail_types(mail: MailMessage, profile: dict[str, Any]) -> list[str]:
+    """Nomi dei Tipi mail che non possono essere esclusi usando i soli header.
+
+    Una regola sul body viene rinviata e quindi non rende falso il Tipo mail in
+    Lettura. Serve anche per rendere esplicito nel log perché una mail è candidata.
+    """
+    header_sources = {"sender", "subject", "date", "recipient", "message_id"}
+    names: list[str] = []
+    for mail_type in profile.get("mail_types", []) or []:
+        if not isinstance(mail_type, dict):
+            continue
+        if not bool(mail_type.get("enabled", True)):
+            continue
+        rules = mail_type.get("match_rules")
+        if rules is None:
+            # Per i profili storici deleghiamo al vecchio pre-filtro globale:
+            # non è possibile attribuire con certezza il singolo Tipo senza
+            # duplicarne tutta la logica legacy.
+            if header_prefilter_matches_profile(mail, {"mail_types": [mail_type]}):
+                names.append(str(mail_type.get("name", "") or ""))
+            continue
+        active = [
+            r for r in rules
+            if isinstance(r, dict) and (
+                str(r.get("trigger", "") or "").strip()
+                or (
+                    str(r.get("source", "") or "") == "date"
+                    and (str(r.get("valid_from", "") or "").strip() or str(r.get("valid_to", "") or "").strip())
+                )
+            )
+        ]
+        if not active:
+            continue
+        header_rules = [r for r in active if str(r.get("source", "body") or "body") in header_sources]
+        if all(match_selection_rule(mail, r) for r in header_rules):
+            names.append(str(mail_type.get("name", "") or ""))
+    return names
+
+
 def matching_mail_types(mail: MailMessage, profile: dict[str, Any]) -> list[dict[str, Any]]:
-    return [mt for mt in profile.get("mail_types", []) if isinstance(mt, dict) and matches_mail_type(mail, mt)]
+    """Restituisce al massimo il primo Tipo mail che fa match, secondo l'ordine del profilo."""
+    for mt in profile.get("mail_types", []) or []:
+        if isinstance(mt, dict) and matches_mail_type(mail, mt):
+            return [mt]
+    return []
 
 
 @dataclass
@@ -276,12 +436,58 @@ def _trimmed_line_spans(source: str) -> list[tuple[str, int, int]]:
     return out
 
 
+
+def _mail_date_for_rule_validity(mail: MailMessage) -> date | None:
+    """Restituisce la data civile della mail per il controllo validità regola."""
+    raw = getattr(mail, "raw_date", "") or getattr(mail, "date", "") or ""
+    if raw:
+        try:
+            parsed = parsedate_to_datetime(str(raw))
+            if parsed is not None:
+                return parsed.date()
+        except Exception:
+            pass
+        text = str(raw).strip()
+        for candidate in (text[:10], text):
+            try:
+                return date.fromisoformat(candidate)
+            except Exception:
+                pass
+    return None
+
+
+def rule_valid_for_mail_date(mail: MailMessage, rule: dict[str, Any]) -> tuple[bool, str]:
+    """Controlla gli estremi inclusivi valid_from/valid_to della regola."""
+    start_text = str(rule.get("valid_from", "") or "").strip()
+    end_text = str(rule.get("valid_to", "") or "").strip()
+    if not start_text and not end_text:
+        return True, ""
+    mail_day = _mail_date_for_rule_validity(mail)
+    if mail_day is None:
+        return False, "Data mail non interpretabile per il controllo di validità"
+    try:
+        start = date.fromisoformat(start_text) if start_text else None
+        end = date.fromisoformat(end_text) if end_text else None
+    except ValueError:
+        return False, "Intervallo di validità della regola non valido"
+    if start is not None and mail_day < start:
+        return False, f"Regola non valida alla data mail {mail_day.isoformat()}: inizio validità {start.isoformat()}"
+    if end is not None and mail_day > end:
+        return False, f"Regola non valida alla data mail {mail_day.isoformat()}: fine validità {end.isoformat()}"
+    return True, ""
+
+
 def extract_rule_trace(mail: MailMessage, rule: dict[str, Any]) -> ExtractionTrace:
     """Applica una regola restituendo anche le posizioni usate dalla GUI."""
     source_name = str(rule.get("source", "body") or "body")
     source = normalize_text(_source(mail, source_name))
     trace = ExtractionTrace(source_name=source_name, source_text=source)
     strategy = str(rule.get("strategy", "regex") or "regex")
+
+    valid, validity_message = rule_valid_for_mail_date(mail, rule)
+    if not valid:
+        trace.error = validity_message
+        return trace
 
     try:
         if strategy == "regex":
@@ -465,6 +671,16 @@ def humanize_extraction_rule(
     }
     policy = str(rule.get("existing_value_policy", "replace") or "replace")
     result += " " + policy_labels.get(policy, policy_labels["replace"]) + "."
+    valid_from = str(rule.get("valid_from", "") or "").strip()
+    valid_to = str(rule.get("valid_to", "") or "").strip()
+    if valid_from and valid_to:
+        result += f" La regola si applica alle mail dal {valid_from} al {valid_to}, estremi inclusi."
+    elif valid_from:
+        result += f" La regola si applica alle mail con data dal {valid_from} in poi."
+    elif valid_to:
+        result += f" La regola si applica alle mail con data fino al {valid_to} compreso."
+    else:
+        result += " La regola non ha limiti temporali di validità."
     if reconcile_key:
         result += " Il campo è una chiave di riconciliazione tra più mail."
     return result
@@ -526,7 +742,7 @@ def extract_for_mail_type(mail: MailMessage, mail_type: dict[str, Any], profile:
 
 
 def extract_message_all(mail: MailMessage, profile: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """Applica le regole di estrazione di tutti i tipi mail che fanno match."""
+    """Applica le regole solo al primo Tipo mail che fa match, in ordine di priorità."""
     out: list[tuple[str, dict[str, Any]]] = []
     for mt in matching_mail_types(mail, profile):
         out.append((str(mt.get("name", "")), extract_for_mail_type(mail, mt, profile)))
@@ -569,21 +785,32 @@ def reconcile(records: list[dict[str, Any]], profile: dict[str, Any]) -> list[di
 
 
 def selection_rule_results(mail: MailMessage, mail_type: dict[str, Any]) -> list[dict[str, Any]]:
-    """Restituisce l'esito dettagliato delle sole regole di selezione compilate."""
+    """Restituisce l'esito dettagliato di tutte le regole di selezione attive.
+
+    Le regole Data sono attive anche senza trigger: usano valid_from/valid_to.
+    Questa funzione deve restare semanticamente allineata a ``matches_mail_type``
+    perché viene usata dalla pipeline dettagliata di Estrazione.
+    """
     out: list[dict[str, Any]] = []
     for rule in mail_type.get("match_rules", []) or []:
         if not isinstance(rule, dict):
             continue
+        source = str(rule.get("source", "body") or "body")
         trigger = str(rule.get("trigger", "") or "").strip()
-        if not trigger:
+        valid_from = str(rule.get("valid_from", "") or "").strip()
+        valid_to = str(rule.get("valid_to", "") or "").strip()
+        is_date_rule = source == "date" and bool(valid_from or valid_to)
+        if not trigger and not is_date_rule:
             continue
         mode = str(rule.get("mode", "contains") or "contains")
         out.append({
             "name": str(rule.get("name", "") or ""),
-            "source": str(rule.get("source", "body") or "body"),
+            "source": source,
             "mode": mode,
             "trigger": trigger,
-            "expanded_trigger": expand_regex(trigger) if mode == "regex" else trigger,
+            "expanded_trigger": expand_regex(trigger) if (mode == "regex" and trigger) else trigger,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
             "matched": bool(match_selection_rule(mail, rule)),
         })
     return out
@@ -637,4 +864,6 @@ def extract_mail_detailed(mail: MailMessage, profile: dict[str, Any]) -> dict[st
             "updates": updates,
             "candidate": candidate,
         })
+        # Priorità sequenziale: il primo Tipo mail che fa match vince.
+        break
     return {"mail": mail, "types": type_results}

@@ -1,4 +1,4 @@
-# EgoMailExtractor Community 1.45.2
+# EgoMailExtractor Community 1.47.5
 
 ## Novità v1.45.2
 
